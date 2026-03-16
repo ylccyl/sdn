@@ -1,0 +1,680 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { 
+  Server, 
+  Network, 
+  Laptop, 
+  Activity, 
+  Zap, 
+  Search, 
+  Plus, 
+  Trash2, 
+  Menu,
+  X,
+  Globe,
+  Share2,
+  Cpu,
+  ArrowLeftCircle,
+  AlertTriangle,
+  BarChart3
+} from 'lucide-react';
+
+// --- 1. 数据初始化 ---
+
+// 生成根控制器 (HA Pair)
+const rootControllers = [
+  { id: 'rc-m', type: 'root', role: 'Master', ip: '10.0.0.1', status: 'active', region: 'Global', cpu: 55 },
+  { id: 'rc-s', type: 'root', role: 'Slave', ip: '10.0.0.2', status: 'standby', region: 'Global', cpu: 10 },
+];
+
+// 生成8个子控制器
+const subControllers = Array.from({ length: 8 }).map((_, i) => ({
+  id: `sc-${i+1}`,
+  type: 'sub',
+  name: `Sub-Ctrl-${i+1}`,
+  ip: `192.168.${i+1}.1`,
+  domainId: i + 1,
+  status: 'active',
+  load: Math.floor(Math.random() * 40) + 20,
+}));
+
+// 预生成所有交换机 (全局可见)
+const generateAllSwitches = () => {
+  const allSwitches = [];
+  subControllers.forEach(sc => {
+    // 每个子域分配 2 台交换机以适应屏幕布局
+    for (let i = 0; i < 2; i++) {
+      allSwitches.push({
+        id: `s-${sc.domainId}-${i+1}`,
+        type: 'switch',
+        domainId: sc.domainId,
+        dpid: `00:${sc.domainId.toString().padStart(2, '0')}:00:00:00:${(i+1).toString().padStart(2, '0')}`,
+        ip: `192.168.${sc.domainId}.${10+i}`,
+        // 初始指标
+        throughput: 0,
+        latency: 0,
+        loss: 0,
+      });
+    }
+  });
+  return allSwitches;
+};
+
+const initialSwitches = generateAllSwitches();
+
+// 初始流表 (为空或预设一些)
+const initialFlowTables = {};
+initialSwitches.forEach(sw => {
+  initialFlowTables[sw.id] = [
+    { id: Date.now() + Math.random(), priority: 100, match: 'in_port=1, dl_type=IP', action: 'output:2', packets: Math.floor(Math.random() * 1000) },
+    { id: Date.now() + Math.random() + 1, priority: 50, match: 'arp', action: 'flood', packets: Math.floor(Math.random() * 500) }
+  ];
+});
+
+// 初始域间路由表
+const initialGlobalRoutes = [
+  { id: 1, dest: 'Domain 2', nextHop: 'Sub-Ctrl-2', cost: 10 },
+  { id: 2, dest: 'Domain 3', nextHop: 'Sub-Ctrl-3', cost: 15 },
+  { id: 3, dest: 'Domain 5', nextHop: 'Sub-Ctrl-1', cost: 20 },
+];
+
+const App = () => {
+  const [selectedNode, setSelectedNode] = useState(null);
+  const [expandedDomain, setExpandedDomain] = useState(null); // 当前聚焦的子域ID (用于显示主机)
+  const [switches, setSwitches] = useState(initialSwitches);
+  const [flowTables, setFlowTables] = useState(initialFlowTables);
+  const [globalRoutes, setGlobalRoutes] = useState(initialGlobalRoutes);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [showAddFlowModal, setShowAddFlowModal] = useState(false);
+  const [globalMetrics, setGlobalMetrics] = useState({ globalTput: 0, latency: 0 });
+
+  // 动态生成主机 (仅在 expandedDomain 改变时计算)
+  const currentHosts = useMemo(() => {
+    if (!expandedDomain) return [];
+    // 找到该域下的交换机
+    const domainSwitches = switches.filter(s => s.domainId === expandedDomain);
+    // 为每台交换机生成2台主机
+    return domainSwitches.flatMap((sw, i) => [
+      { id: `h-${sw.id}-1`, type: 'host', ip: `10.${sw.domainId}.${i}.2`, connectedTo: sw.id, port: 1 },
+      { id: `h-${sw.id}-2`, type: 'host', ip: `10.${sw.domainId}.${i}.3`, connectedTo: sw.id, port: 2 },
+    ]);
+  }, [expandedDomain, switches]);
+
+  // --- 模拟实时数据 ---
+  useEffect(() => {
+    const timer = setInterval(() => {
+      // 1. 更新全局指标
+      setGlobalMetrics({
+        globalTput: Math.floor(Math.random() * 2000) + 5000,
+        latency: Math.floor(Math.random() * 20) + 5,
+      });
+
+      // 2. 更新交换机指标 (Tput, Latency, Loss)
+      setSwitches(prev => prev.map(sw => ({
+        ...sw,
+        throughput: Math.floor(Math.random() * 800) + 100, // Mbps
+        latency: Math.floor(Math.random() * 15) + 1, // ms
+        loss: (Math.random() * 0.5).toFixed(2) // %
+      })));
+
+      // 3. 更新流表 Packet 计数
+      setFlowTables(prev => {
+        const newTables = { ...prev };
+        Object.keys(newTables).forEach(swId => {
+          newTables[swId] = newTables[swId].map(flow => ({
+            ...flow,
+            packets: flow.packets + Math.floor(Math.random() * 20)
+          }));
+        });
+        return newTables;
+      });
+
+    }, 2000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // --- 交互处理 ---
+  const handleNodeClick = (node) => {
+    setSelectedNode(node);
+    setSidebarOpen(true);
+
+    // 逻辑：点击子控制器 -> 展开显示主机
+    if (node.type === 'sub') {
+      if (expandedDomain !== node.domainId) {
+        setExpandedDomain(node.domainId);
+      }
+    }
+    // 点击根控制器 -> 返回全局概览 (隐藏主机)
+    if (node.type === 'root') {
+      setExpandedDomain(null);
+    }
+  };
+
+  const handleAddFlow = (e) => {
+    e.preventDefault();
+    const formData = new FormData(e.target);
+    const newFlow = {
+      id: Date.now(),
+      priority: parseInt(formData.get('priority')),
+      match: formData.get('match'),
+      action: formData.get('action'),
+      packets: 0
+    };
+    
+    if (selectedNode && selectedNode.type === 'switch') {
+      setFlowTables(prev => ({
+        ...prev,
+        [selectedNode.id]: [...(prev[selectedNode.id] || []), newFlow]
+      }));
+      setShowAddFlowModal(false);
+    }
+  };
+
+  const handleDeleteFlow = (switchId, flowId) => {
+    setFlowTables(prev => ({
+      ...prev,
+      [switchId]: prev[switchId].filter(f => f.id !== flowId)
+    }));
+  };
+
+  // --- 拓扑布局计算 ---
+  const topologyLayout = useMemo(() => {
+    // 1. 根控制器 (顶部)
+    const rootNodes = rootControllers.map((rc, i) => ({
+      ...rc,
+      x: 50 + (i === 0 ? -5 : 5),
+      y: 10
+    }));
+
+    // 2. 子控制器 & 交换机布局
+    // 布局策略：如果展开了某个域，该域居中放大，其他域缩小；否则均匀网格排列
+    let subNodes = [];
+    let switchNodes = [];
+    let hostNodes = [];
+
+    // 全局网格参数
+    const cols = 4; 
+    
+    subNodes = subControllers.map((sc, i) => {
+      const isExpanded = expandedDomain === sc.domainId;
+      const isAnyExpanded = expandedDomain !== null;
+
+      let x, y, scale, opacity;
+
+      if (isAnyExpanded) {
+        // 聚焦模式
+        if (isExpanded) {
+          x = 50; y = 40; scale = 1.2; opacity = 1;
+        } else {
+          // 其他节点移到边缘
+          x = (i % 2 === 0) ? 10 : 90;
+          y = 20 + Math.floor(i/2) * 15;
+          scale = 0.6; opacity = 0.3;
+        }
+      } else {
+        // 全局均匀模式 (2行4列)
+        const row = Math.floor(i / cols);
+        const col = i % cols;
+        x = 20 + col * 20;
+        y = 30 + row * 25;
+        scale = 1; opacity = 1;
+      }
+      return { ...sc, x, y, scale, opacity };
+    });
+
+    // 放置交换机 (相对于所属子控制器)
+    switches.forEach(sw => {
+      const parentSub = subNodes.find(n => n.domainId === sw.domainId);
+      if (parentSub) {
+        // 简单的偏移：第一台在左下，第二台在右下
+        const swIndex = parseInt(sw.id.split('-').pop()) - 1; 
+        const offsetX = (swIndex === 0 ? -4 : 4) * (parentSub.scale || 1);
+        const offsetY = 12 * (parentSub.scale || 1);
+        
+        switchNodes.push({
+          ...sw,
+          x: parentSub.x + offsetX,
+          y: parentSub.y + offsetY,
+          opacity: parentSub.opacity,
+          scale: parentSub.scale * 0.9 // 交换机比控制器略小
+        });
+      }
+    });
+
+    // 放置主机 (仅当展开时，且只针对该域的交换机)
+    if (expandedDomain) {
+      currentHosts.forEach(h => {
+        const parentSw = switchNodes.find(s => s.id === h.connectedTo);
+        if (parentSw) {
+          const offset = h.port === 1 ? -3 : 3;
+          hostNodes.push({
+            ...h,
+            x: parentSw.x + offset,
+            y: parentSw.y + 10,
+            opacity: 1,
+            scale: 0.8
+          });
+        }
+      });
+    }
+
+    return { rootNodes, subNodes, switchNodes, hostNodes };
+  }, [expandedDomain, switches, currentHosts]);
+
+  return (
+    <div className="flex h-screen bg-slate-950 text-slate-200 font-sans overflow-hidden selection:bg-blue-500/30">
+      
+      {/* --- Add Flow Modal --- */}
+      {showAddFlowModal && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="bg-slate-900 w-[450px] rounded-xl shadow-2xl border border-slate-700 p-6 animate-in fade-in zoom-in duration-200">
+            <div className="flex justify-between items-center mb-6 border-b border-slate-800 pb-4">
+              <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                <Plus className="w-5 h-5 text-blue-500"/> 添加流表规则 (Add Flow)
+              </h3>
+              <button onClick={() => setShowAddFlowModal(false)} className="text-slate-500 hover:text-white"><X className="w-5 h-5" /></button>
+            </div>
+            <form onSubmit={handleAddFlow} className="space-y-5">
+              <div>
+                <label className="block text-xs font-bold text-slate-400 mb-1.5 uppercase">优先级 (Priority)</label>
+                <input type="number" name="priority" defaultValue="100" className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all" required />
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-400 mb-1.5 uppercase">匹配域 (Match)</label>
+                <input type="text" name="match" placeholder="e.g., in_port=1, eth_type=0x0800" className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none font-mono" required />
+                <p className="text-[10px] text-slate-600 mt-1">支持标准 OpenFlow 1.3 匹配字段</p>
+              </div>
+              <div>
+                <label className="block text-xs font-bold text-slate-400 mb-1.5 uppercase">动作 (Action)</label>
+                <input type="text" name="action" placeholder="e.g., output:2, drop, flood" className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none font-mono" required />
+              </div>
+              <div className="flex gap-3 pt-4">
+                <button type="button" onClick={() => setShowAddFlowModal(false)} className="flex-1 py-2.5 bg-slate-800 hover:bg-slate-700 rounded-lg text-sm font-medium text-slate-300 transition-colors">取消</button>
+                <button type="submit" className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm font-bold text-white shadow-lg shadow-blue-900/20 transition-all">立即下发</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* --- 主区域 --- */}
+      <div className="flex-1 flex flex-col relative">
+        
+        {/* 顶部导航 */}
+        <header className="h-16 bg-slate-900/80 backdrop-blur-md border-b border-slate-800 flex items-center justify-between px-6 z-20">
+          <div className="flex items-center gap-4">
+            <div className="bg-amber-600 p-2 rounded-lg shadow-lg shadow-amber-900/20">
+              <Globe className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-slate-100 tracking-tight">Hierarchical <span className="text-amber-500">SDN View</span></h1>
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <span className="flex h-2 w-2 rounded-full bg-green-500 animate-pulse"></span>
+                System Healthy
+              </div>
+            </div>
+          </div>
+
+          <div className="flex gap-8">
+            <MetricBox icon={Activity} label="Global Throughput" value={`${globalMetrics.globalTput} Mbps`} color="text-blue-400" />
+            <MetricBox icon={Zap} label="Avg Latency" value={`${globalMetrics.latency} ms`} color="text-amber-400" />
+          </div>
+        </header>
+
+        {/* --- 拓扑画布 --- */}
+        <div className="flex-1 relative bg-slate-950 overflow-hidden" 
+             style={{ backgroundImage: 'radial-gradient(#334155 1px, transparent 1px)', backgroundSize: '30px 30px' }}>
+          
+          {/* 返回全局视图按钮 */}
+          {expandedDomain && (
+            <button 
+              onClick={() => { setExpandedDomain(null); setSelectedNode(null); }}
+              className="absolute top-6 left-6 z-30 flex items-center gap-2 px-4 py-2 bg-slate-800/90 hover:bg-slate-700 text-white rounded-full shadow-lg border border-slate-600 transition-all"
+            >
+              <ArrowLeftCircle className="w-5 h-5" /> 返回全局 (Hide Hosts)
+            </button>
+          )}
+
+          <svg className="absolute inset-0 w-full h-full pointer-events-none z-0">
+            <defs>
+              <linearGradient id="rootLink" x1="0%" y1="0%" x2="0%" y2="100%">
+                <stop offset="0%" stopColor="#d97706" stopOpacity="0.6" />
+                <stop offset="100%" stopColor="#3b82f6" stopOpacity="0.2" />
+              </linearGradient>
+            </defs>
+
+            {/* 1. Root HA 连线 */}
+            <line 
+              x1={`${topologyLayout.rootNodes[0].x}%`} y1={`${topologyLayout.rootNodes[0].y}%`}
+              x2={`${topologyLayout.rootNodes[1].x}%`} y2={`${topologyLayout.rootNodes[1].y}%`}
+              stroke="#d97706" strokeWidth="2" strokeDasharray="4,4" opacity="0.5"
+            />
+
+            {/* 2. Root -> Sub 连线 */}
+            {topologyLayout.subNodes.map(sc => {
+              const root = topologyLayout.rootNodes[0];
+              return (
+                <line 
+                  key={`link-r-${sc.id}`}
+                  x1={`${root.x}%`} y1={`${root.y + 5}%`}
+                  x2={`${sc.x}%`} y2={`${sc.y - 5}%`}
+                  stroke="url(#rootLink)" strokeWidth={sc.opacity === 1 ? 2 : 1} opacity={sc.opacity * 0.5}
+                />
+              );
+            })}
+
+            {/* 3. Sub -> Switch 连线 (始终显示) */}
+            {topologyLayout.switchNodes.map(sw => {
+              const parent = topologyLayout.subNodes.find(sc => sc.domainId === sw.domainId);
+              if (!parent) return null;
+              return (
+                <line 
+                  key={`link-${parent.id}-${sw.id}`}
+                  x1={`${parent.x}%`} y1={`${parent.y + 5}%`}
+                  x2={`${sw.x}%`} y2={`${sw.y - 5}%`}
+                  stroke="#3b82f6" strokeWidth="1.5" opacity={sw.opacity * 0.4}
+                />
+              );
+            })}
+
+            {/* 4. Switch -> Host 连线 (仅在展开时显示) */}
+            {topologyLayout.hostNodes.map(h => {
+              const parent = topologyLayout.switchNodes.find(s => s.id === h.connectedTo);
+              if (!parent) return null;
+              return (
+                <line 
+                  key={`link-${parent.id}-${h.id}`}
+                  x1={`${parent.x}%`} y1={`${parent.y + 5}%`}
+                  x2={`${h.x}%`} y2={`${h.y - 5}%`}
+                  stroke="#64748b" strokeWidth="1" opacity="0.4"
+                />
+              );
+            })}
+          </svg>
+
+          {/* --- 节点渲染 --- */}
+          
+          {/* Root */}
+          {topologyLayout.rootNodes.map(node => (
+            <NodeItem 
+              key={node.id} node={node} 
+              selected={selectedNode?.id === node.id}
+              onClick={() => handleNodeClick(node)}
+              icon={Globe}
+              color="bg-amber-900/90 border-amber-500 text-amber-400"
+              label={`Root (${node.role})`}
+            />
+          ))}
+
+          {/* Sub Controllers */}
+          {topologyLayout.subNodes.map(node => (
+            <NodeItem 
+              key={node.id} node={node} 
+              selected={selectedNode?.id === node.id}
+              onClick={() => handleNodeClick(node)}
+              icon={Server}
+              color="bg-blue-900/90 border-blue-500 text-blue-400"
+              label={node.name}
+            />
+          ))}
+
+          {/* Switches (带指标) */}
+          {topologyLayout.switchNodes.map(node => (
+            <SwitchNodeItem
+              key={node.id} node={node}
+              selected={selectedNode?.id === node.id}
+              onClick={() => handleNodeClick(node)}
+            />
+          ))}
+
+          {/* Hosts */}
+          {topologyLayout.hostNodes.map(node => (
+            <NodeItem 
+              key={node.id} node={node} 
+              selected={selectedNode?.id === node.id}
+              onClick={() => handleNodeClick(node)}
+              icon={Laptop}
+              color="bg-slate-800/90 border-slate-600 text-slate-400"
+              label={node.ip}
+              isSmall
+            />
+          ))}
+
+          {/* 视图状态指示器 */}
+          <div className="absolute bottom-6 right-6 flex flex-col items-end gap-2 pointer-events-none">
+            <div className="bg-slate-900/80 backdrop-blur px-4 py-2 rounded-lg border border-slate-800 text-slate-400 text-sm shadow-xl">
+              Mode: <span className="text-white font-bold">{expandedDomain ? `Sub-Domain ${expandedDomain} (Hosts Visible)` : 'Global View (Controllers + Switches)'}</span>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      {/* --- 右侧控制面板 --- */}
+      <div className={`w-[420px] bg-slate-900 border-l border-slate-800 flex flex-col shadow-2xl z-30 transition-transform duration-300 ${sidebarOpen ? 'translate-x-0' : 'translate-x-full'} absolute right-0 h-full`}>
+        
+        {/* Panel Header */}
+        <div className="p-6 border-b border-slate-800 flex justify-between items-start bg-slate-800/30">
+          <div className="flex items-center gap-3">
+             <div className={`p-2 rounded-lg ${
+               selectedNode?.type === 'switch' ? 'bg-cyan-900/50 text-cyan-400' : 
+               selectedNode?.type === 'root' ? 'bg-amber-900/50 text-amber-400' : 
+               selectedNode?.type === 'sub' ? 'bg-blue-900/50 text-blue-400' : 'bg-slate-800 text-slate-400'
+             }`}>
+               {selectedNode?.type === 'root' ? <Globe className="w-6 h-6"/> : 
+                selectedNode?.type === 'sub' ? <Server className="w-6 h-6"/> :
+                selectedNode?.type === 'switch' ? <Network className="w-6 h-6"/> : <Laptop className="w-6 h-6"/>}
+             </div>
+             <div>
+               <h2 className="text-lg font-bold text-white leading-tight">
+                 {selectedNode?.type === 'root' ? 'Root Controller' : 
+                  selectedNode?.type === 'sub' ? 'Sub Controller' : 
+                  selectedNode?.type === 'switch' ? 'OpenFlow Switch' : 'End Host'}
+               </h2>
+               <p className="text-xs text-slate-500 font-mono mt-1">{selectedNode?.id}</p>
+             </div>
+          </div>
+          <button onClick={() => setSidebarOpen(false)} className="text-slate-500 hover:text-white p-1 hover:bg-slate-800 rounded transition-colors"><X className="w-5 h-5"/></button>
+        </div>
+
+        {/* Panel Content */}
+        <div className="flex-1 overflow-y-auto p-6 space-y-8">
+          
+          {!selectedNode && (
+            <div className="text-center text-slate-500 mt-20">
+              <Share2 className="w-16 h-16 mx-auto mb-4 opacity-20" />
+              <p>Select a node from the topology</p>
+            </div>
+          )}
+
+          {/* --- 通用信息：主机/控制器/交换机 --- */}
+          {selectedNode && (
+            <div className="space-y-2">
+              <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Basic Info</h3>
+              <div className="bg-slate-800/50 rounded-xl p-4 border border-slate-700/50 space-y-3">
+                <InfoRow label="IP Address" value={selectedNode.ip} />
+                {selectedNode.dpid && <InfoRow label="DPID" value={selectedNode.dpid} />}
+                {selectedNode.role && <InfoRow label="Role" value={selectedNode.role} />}
+                {selectedNode.mac && <InfoRow label="MAC" value={selectedNode.mac || 'Unknown'} />}
+                {selectedNode.cpu && <InfoRow label="CPU Load" value={`${selectedNode.cpu}%`} />}
+                {/* 交换机特有实时指标 */}
+                {selectedNode.type === 'switch' && (
+                  <>
+                     <div className="h-px bg-slate-700/50 my-2"></div>
+                     <InfoRow label="Throughput" value={`${selectedNode.throughput} Mbps`} highlight />
+                     <InfoRow label="Latency" value={`${selectedNode.latency} ms`} />
+                     <InfoRow label="Packet Loss" value={`${selectedNode.loss}%`} color="text-red-400" />
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* --- 交换机：流表管理 --- */}
+          {selectedNode?.type === 'switch' && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-2">
+                  <Network className="w-3.5 h-3.5" /> Flow Tables
+                </h3>
+                <button 
+                  onClick={() => setShowAddFlowModal(true)}
+                  className="text-xs bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-md shadow-lg shadow-blue-900/20 flex items-center gap-1.5 transition-all transform active:scale-95"
+                >
+                  <Plus className="w-3.5 h-3.5" /> 添加规则
+                </button>
+              </div>
+              
+              <div className="space-y-3 min-h-[200px]">
+                 {(flowTables[selectedNode.id] || []).length > 0 ? (
+                   (flowTables[selectedNode.id] || []).map((flow) => (
+                     <div key={flow.id} className="bg-slate-800 border border-slate-700/60 p-3.5 rounded-lg group hover:border-blue-500/50 transition-colors shadow-sm">
+                        <div className="flex justify-between items-start mb-2.5">
+                          <div className="flex items-center gap-2">
+                             <span className="bg-slate-700/50 px-2 py-0.5 rounded text-[10px] font-mono text-slate-300 border border-slate-600/30">Pri: {flow.priority}</span>
+                             <span className="flex h-1.5 w-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.6)]"></span>
+                          </div>
+                          <button onClick={() => handleDeleteFlow(selectedNode.id, flow.id)} className="text-slate-600 hover:text-red-400 transition-colors p-1 rounded-md hover:bg-slate-700/50 opacity-0 group-hover:opacity-100">
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                        <div className="space-y-1.5">
+                          <div className="flex gap-2 text-xs">
+                            <span className="text-slate-500 font-medium w-10">Match:</span>
+                            <span className="font-mono text-yellow-400/90 truncate flex-1" title={flow.match}>{flow.match}</span>
+                          </div>
+                          <div className="flex gap-2 text-xs">
+                            <span className="text-slate-500 font-medium w-10">Action:</span>
+                            <span className="font-mono text-cyan-400/90 truncate flex-1">{flow.action}</span>
+                          </div>
+                        </div>
+                        <div className="mt-3 pt-2 border-t border-slate-700/30 flex justify-between items-center text-[10px] text-slate-400">
+                          <span>ID: {Math.floor(flow.id)}</span>
+                          <span className="flex items-center gap-1 font-mono bg-slate-900/30 px-1.5 py-0.5 rounded">
+                             <Activity className="w-3 h-3 text-blue-500" /> {flow.packets} pkts
+                          </span>
+                        </div>
+                     </div>
+                   ))
+                 ) : (
+                   <div className="flex flex-col items-center justify-center py-10 border-2 border-dashed border-slate-800 rounded-xl bg-slate-800/20">
+                      <div className="bg-slate-800 p-3 rounded-full mb-3">
+                        <Network className="w-5 h-5 text-slate-600" />
+                      </div>
+                      <p className="text-sm text-slate-500">暂无流表规则</p>
+                      <p className="text-xs text-slate-600 mt-1">点击上方按钮添加第一条规则</p>
+                   </div>
+                 )}
+              </div>
+            </div>
+          )}
+
+          {/* --- 根控制器：路由表 --- */}
+          {selectedNode?.type === 'root' && (
+            <div>
+                <div className="flex justify-between items-center mb-3">
+                  <h3 className="text-slate-500 font-bold text-xs uppercase tracking-wider">Global Routing Table</h3>
+                </div>
+                <div className="space-y-2">
+                  {globalRoutes.map(route => (
+                    <div key={route.id} className="bg-slate-800 p-3 rounded-lg border border-slate-700 flex justify-between items-center">
+                      <div>
+                        <div className="text-white text-sm font-medium">Dest: {route.dest}</div>
+                        <div className="text-xs text-slate-500 mt-0.5">via {route.nextHop}</div>
+                      </div>
+                      <div className="bg-slate-900 px-2 py-1 rounded text-xs text-slate-400 font-mono border border-slate-700">
+                        Cost: {route.cost}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+            </div>
+          )}
+
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- 子组件 ---
+
+// 通用信息行
+const InfoRow = ({ label, value, highlight, color }) => (
+  <div className="flex justify-between items-center text-sm">
+    <span className="text-slate-400">{label}</span>
+    <span className={`font-mono truncate ml-4 ${highlight ? 'text-white font-bold bg-slate-700/50 px-2 py-0.5 rounded' : (color || 'text-slate-200')}`}>
+      {value}
+    </span>
+  </div>
+);
+
+// 顶部指标卡片
+const MetricBox = ({ icon: Icon, label, value, color }) => (
+  <div className="flex items-center gap-3 bg-slate-800/50 px-4 py-2 rounded-lg border border-slate-700/50 shadow-sm">
+    <Icon className={`w-4 h-4 ${color}`} />
+    <div className="flex flex-col">
+      <span className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">{label}</span>
+      <span className="text-sm font-mono font-bold text-slate-200">{value}</span>
+    </div>
+  </div>
+);
+
+// 通用节点
+const NodeItem = ({ node, selected, onClick, icon: Icon, color, label, isSmall }) => (
+  <div
+    onClick={onClick}
+    className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer group transition-all duration-500 ease-out"
+    style={{ 
+      left: `${node.x}%`, top: `${node.y}%`, 
+      opacity: node.opacity ?? 1,
+      transform: `translate(-50%, -50%) scale(${node.scale ?? 1})`
+    }}
+  >
+    <div className={`
+      relative flex flex-col items-center justify-center shadow-2xl backdrop-blur-sm border-2
+      ${isSmall ? 'w-8 h-8' : 'w-14 h-14'} rounded-full ${color}
+      ${selected ? 'ring-4 ring-white/20 scale-110 z-50 shadow-blue-500/20' : 'hover:scale-105 z-10'}
+    `}>
+      <Icon className={isSmall ? 'w-4 h-4' : 'w-7 h-7'} />
+    </div>
+    {!isSmall && (
+      <div className={`absolute top-full mt-2 bg-slate-900/90 text-slate-300 text-[10px] px-2 py-1 rounded border border-slate-700 shadow-xl backdrop-blur whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity`}>
+        {label}
+      </div>
+    )}
+  </div>
+);
+
+// 专用交换机节点 (显示实时指标)
+const SwitchNodeItem = ({ node, selected, onClick }) => (
+  <div
+    onClick={onClick}
+    className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer group transition-all duration-500 ease-out"
+    style={{ 
+      left: `${node.x}%`, top: `${node.y}%`, 
+      opacity: node.opacity ?? 1,
+      transform: `translate(-50%, -50%) scale(${node.scale ?? 1})`
+    }}
+  >
+    {/* 主图标 */}
+    <div className={`
+      relative flex flex-col items-center justify-center shadow-xl backdrop-blur-sm border-2
+      w-12 h-12 rounded-lg bg-cyan-900/90 border-cyan-500 text-cyan-400
+      ${selected ? 'ring-4 ring-white/20 scale-110 z-50 border-cyan-400' : 'hover:scale-105 z-10'}
+    `}>
+      <Network className="w-6 h-6" />
+    </div>
+
+    {/* 实时指标悬浮窗 (常驻或Hover显示) */}
+    <div className={`
+      absolute -top-12 left-1/2 -translate-x-1/2 bg-slate-900/95 text-slate-200 text-[9px] p-1.5 rounded border border-slate-700 shadow-xl whitespace-nowrap flex flex-col gap-0.5
+      ${selected || node.scale > 1 ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity pointer-events-none z-50
+    `}>
+       <div className="flex items-center gap-1"><BarChart3 className="w-3 h-3 text-green-400"/> {node.throughput} Mbps</div>
+       <div className="flex items-center gap-1"><Activity className="w-3 h-3 text-yellow-400"/> {node.latency} ms</div>
+       <div className="flex items-center gap-1"><AlertTriangle className="w-3 h-3 text-red-400"/> {node.loss}% Loss</div>
+    </div>
+  </div>
+);
+
+export default App;

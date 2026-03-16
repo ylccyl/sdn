@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>拓扑测试页面</title>
+    <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        #network { width: 100%; height: 600px; border: 1px solid #ccc; }
+        #debug { margin-top: 20px; padding: 10px; background: #f0f0f0; }
+        button { margin: 5px; padding: 10px 20px; }
+    </style>
+</head>
+<body>
+    <h1>拓扑测试页面</h1>
+    <button onclick="loadTopo()">加载拓扑</button>
+    <button onclick="testAPI()">测试API</button>
+    <div id="network"></div>
+    <div id="debug"></div>
+
+    <script>
+        let network = null;
+        let nodes = new vis.DataSet([]);
+        let edges = new vis.DataSet([]);
+
+        // 初始化网络图
+        function initNetwork() {
+            const container = document.getElementById('network');
+            const data = { nodes: nodes, edges: edges };
+            const options = {
+                nodes: {
+                    shape: 'dot',
+                    size: 20,
+                    font: { size: 14 }
+                },
+                edges: {
+                    arrows: { to: { enabled: true } }
+                },
+                layout: {
+                    hierarchical: {
+                        enabled: true,
+                        direction: 'UD'
+                    }
+                },
+                physics: { enabled: false }
+            };
+            
+            network = new vis.Network(container, data, options);
+            log('网络图初始化完成');
+        }
+
+        function log(msg) {
+            const debug = document.getElementById('debug');
+            debug.innerHTML += msg + '<br>';
+            console.log(msg);
+        }
+
+        async function testAPI() {
+            try {
+                log('测试 /api/health...');
+                const health = await fetch('/api/health');
+                const healthData = await health.json();
+                log('健康检查：' + JSON.stringify(healthData));
+                
+                log('测试 /api/graph...');
+                const graph = await fetch('/api/graph');
+                const graphData = await graph.json();
+                log('图数据节点数：' + graphData.nodes.length);
+                log('图数据边数：' + graphData.edges.length);
+                
+                // 显示前3个节点
+                log('前3个节点：' + JSON.stringify(graphData.nodes.slice(0, 3)));
+            } catch (error) {
+                log('错误：' + error.message);
+            }
+        }
+
+        async function loadTopo() {
+            try {
+                log('开始加载拓扑...');
+                const response = await fetch('/api/graph');
+                const data = await response.json();
+                
+                log(`收到数据：${data.nodes.length}节点，${data.edges.length}边`);
+                
+                // 清空
+                nodes.clear();
+                edges.clear();
+                
+                // 添加节点
+                data.nodes.forEach((nodeObj, index) => {
+                    const nodeId = nodeObj.id;
+                    const nodeData = nodeObj.data || {};
+                    const nodeType = nodeData.node_type || 'unknown';
+                    
+                    let color, shape, label;
+                    if (nodeType === 'root_controller' || nodeId === 'RootController') {
+                        color = '#ff6b6b';
+                        shape = 'star';
+                        label = '根控';
+                    } else if (nodeType === 'controller') {
+                        color = '#a78bfa';
+                        shape = 'diamond';
+                        label = '从控' + index;
+                    } else if (nodeType === 'switch') {
+                        color = '#4dabf7';
+                        shape = 'box';
+                        label = 'SW' + nodeId;
+                    } else {
+                        color = '#51cf66';
+                        shape = 'dot';
+                        label = 'H' + nodeId;
+                    }
+                    
+                    log(`添加节点：${nodeId} (${nodeType})`);
+                    
+                    nodes.add({
+                        id: nodeId,
+                        label: label,
+                        color: color,
+                        shape: shape,
+                        size: 25
+                    });
+                });
+                
+                // 添加边
+                data.edges.forEach((edgeObj, index) => {
+                    const source = edgeObj.source;
+                    const target = edgeObj.target;
+                    const edgeData = edgeObj.data || {};
+                    
+                    log(`添加边：${source} -> ${target}`);
+                    
+                    edges.add({
+                        id: 'edge-' + index,
+                        from: source,
+                        to: target,
+                        color: '#999'
+                    });
+                });
+                
+                log('拓扑加载完成！');
+                network.fit();
+                
+            } catch (error) {
+                log('加载失败：' + error.message);
+                console.error(error);
+            }
+        }
+
+        // 页面加载后初始化
+        window.addEventListener('load', () => {
+            log('页面加载完成');
+            initNetwork();
+            log('点击"加载拓扑"按钮查看拓扑图');
+        });
+    </script>
+</body>
+</html>
+
