@@ -17,8 +17,8 @@ from mininet.log import setLogLevel, info, error
 from mininet.link import TCLink, Intf
 from mininet.util import quietRun
 
-# 控制器配置
-CONTROLLER_IP = '10.5.1.163'
+# 控制器配置(修改了controller_ip，原为10.5.1.163)
+CONTROLLER_IP = '127.0.0.1'
 CONTROLLER_BASE_PORT = 6654
 
 # 物理网卡配置（可选）

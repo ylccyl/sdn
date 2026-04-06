@@ -281,10 +281,11 @@ class ServerAgent:
         self.print_thread.daemon = True
         self.print_thread.start()
 
+	#新修改：取消gui界面
         # 启动GUI界面
-        self.gui_thread = threading.Thread(target=self.start_gui)
-        self.gui_thread.daemon = True
-        self.gui_thread.start()
+        #self.gui_thread = threading.Thread(target=self.start_gui)
+        #self.gui_thread.daemon = True
+        #self.gui_thread.start()
         
         # 启动心跳检测线程
         self.heartbeat_thread = threading.Thread(target=self.heartbeat_check_loop)
@@ -321,6 +322,7 @@ class ServerAgent:
             display: flex;
             height: 100vh;
             overflow: hidden;
+	    padding-top: 64px;
         }
         /* 顶部导航栏 */
         .header {
@@ -373,9 +375,10 @@ class ServerAgent:
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: #22c55e;
             animation: pulse 2s infinite;
         }
+	.status-dot.ok { background: #22c55e; }   /* 正常：绿 */
+	.status-dot.err { background: #ef4444; }  /* 异常：红 */
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
@@ -419,7 +422,6 @@ class ServerAgent:
             flex: 1;
             display: flex;
             flex-direction: column;
-            margin-top: 64px;
             position: relative;
         }
         /* 拓扑图区域 */
@@ -687,9 +689,9 @@ class ServerAgent:
                 <div>
                     <h1 class="header-title">Hierarchical <span>SDN View</span></h1>
                     <div class="header-status">
-                        <span class="status-dot"></span>
-                        System Healthy
-                </div>
+  			<span id="status-dot" class="status-dot ok"></span>
+  			<span id="status" class="status connected"> 已连接</span>
+		</div>
                 </div>
                 </div>
             <div class="header-metrics">
@@ -710,6 +712,12 @@ class ServerAgent:
                         <span class="metric-label">Avg Latency</span>
                         <span class="metric-value" id="metric-latency">0 ms</span>
             </div>
+                </div>
+                <div class="metric-box" style="cursor: pointer;" onclick="refreshTopology()" title="Refresh topology">
+                    <div class="metric-content">
+                        <span class="metric-label">Topology</span>
+                        <span class="metric-value">Refresh</span>
+                    </div>
                 </div>
             </div>
         </header>
@@ -894,9 +902,9 @@ class ServerAgent:
                 console.log('准备加载拓扑数据...');
                 refreshTopology();
                 
-                // 自动刷新（每5秒）
-                setInterval(refreshTopology, 5000);
-                console.log('自动刷新已启用（每5秒）');
+                // 自动刷新（每5秒）disable to increase speed
+                //setInterval(refreshTopology, 30000);
+                //console.log('自动刷新已启用（每30秒）');
                 
             } catch (err) {
                 console.error('初始化网络图失败:', err);
@@ -919,17 +927,24 @@ class ServerAgent:
                 
                 updateNetwork(data);
                 updateStatistics();
+
+		const dot = document.getElementById('status-dot');
+		if (dot) dot.className = 'status-dot ok';
                 
                 document.getElementById('status').className = 'status connected';
-                document.getElementById('status').textContent = '● 已连接';
+                document.getElementById('status').textContent = '已连接';
             } catch (error) {
                 console.error('获取拓扑数据失败:', error);
                 console.error('错误详情:', error.message);
+
+		const dot = document.getElementById('status-dot');
+		if (dot) dot.className = 'status-dot err';
+
                 document.getElementById('status').className = 'status error';
-                document.getElementById('status').textContent = '● 连接错误: ' + error.message;
+                document.getElementById('status').textContent = '连接错误: ' + error.message;
             }
         }
-        
+        window.refreshTopology = refreshTopology;
         // 更新网络图
         function updateNetwork(data) {
             try {
@@ -1609,8 +1624,9 @@ class ServerAgent:
         function showAddFlowModal() {
             alert('添加流表功能待实现');
         }
-        
-        // 删除流表项（占位函数）
+
+
+		// 删除流表项（占位函数）
         function deleteFlow(switchId, flowId) {
             if (confirm('确定要删除这条流表规则吗？')) {
                 console.log('删除流表:', switchId, flowId);
@@ -2522,8 +2538,8 @@ class ServerAgent:
         
         logger.info(f"更新网络图完成: {len(self.G.nodes)} 个节点, {len(self.G.edges)} 条边")
         # print(f"更新网络图完成: {len(self.G.nodes)} 个节点, {len(self.G.edges)} 条边")
-        print(f"**********G图节点: {list(self.G.nodes())}")
-        print(f"**********G图边: {list(self.G.edges(data=True))}")
+        #print(f"**********G图节点: {list(self.G.nodes())}")
+        #print(f"**********G图边: {list(self.G.edges(data=True))}")
     
     def handle_path_request(self, message):
         """处理路径请求"""

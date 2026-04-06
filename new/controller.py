@@ -32,7 +32,8 @@ logger = logging.getLogger("server_agent")
 
 # 添加server配置
 SERVER_CONFIG = {
-    'server_ip': '10.5.1.163',  # 修改为server_agent的实际IP
+    #'server_ip': '10.5.1.163',  # 修改为server_agent的实际IP
+    'server_ip': '127.0.0.1',#二次修改ip
     'server_port': 5001,
     'reconnect_interval': 5
 }
@@ -720,12 +721,19 @@ class TopoAwareness(app_manager.RyuApp):
             print(f"\n【域内链路 (topo_inter_link)】共 {len(self.topo_inter_link)} 条")
             if len(self.topo_inter_link) == 0:
                 print("  (空)")
+            #for (src, dst), info in self.topo_inter_link.items():
+            #    port, timestamp, delay, bw, loss = info
+            #    age = time.time() - timestamp if timestamp > 0 else -1
+            #    print(f"  - {src} -> {dst} | 端口:{port} | 延迟:{delay:.3f}ms | "
+            #          f"带宽:{bw:.1f}Mbps | 更新:{age:.1f}秒前")
             for (src, dst), info in self.topo_inter_link.items():
-                port, timestamp, delay, bw, loss = info
+                if not isinstance(info, (list, tuple)) or len(info) < 5:
+                    print(f"  - {src} -> {dst} | info格式异常: {info}")
+                    continue
+                port, timestamp, delay, bw, loss = info[:5]
                 age = time.time() - timestamp if timestamp > 0 else -1
                 print(f"  - {src} -> {dst} | 端口:{port} | 延迟:{delay:.3f}ms | "
-                      f"带宽:{bw:.1f}Mbps | 更新:{age:.1f}秒前")
-            
+                     f"带宽:{bw:.1f}Mbps | 更新:{age:.1f}秒前")
             # 域间链路 (关键！)
             print(f"\n【域间链路 (topo_access_link)】共 {len(self.topo_access_link)} 条")
             if len(self.topo_access_link) == 0:
@@ -734,13 +742,24 @@ class TopoAwareness(app_manager.RyuApp):
                 print("    1. LLDP包没有跨域传输")
                 print("    2. _lldp_packet_in_handle 没有正确处理")
                 print("    3. 端口配置有问题")
+            #else:
+            #    for (local_dpid, remote_dpid), info in self.topo_access_link.items():
+            #        port, timestamp, delay, bw, loss = info
+            #        age = time.time() - timestamp
+            #        print(f"  - 本域{local_dpid}(端口{port}) <-> 远程域{remote_dpid} | "
+            #              f"延迟:{delay:.3f}ms | 带宽:{bw:.1f}Mbps | 更新:{age:.1f}秒前")
             else:
                 for (local_dpid, remote_dpid), info in self.topo_access_link.items():
-                    port, timestamp, delay, bw, loss = info
-                    age = time.time() - timestamp
+                    # [MOD] 兼容 info 不止 5 个字段的情况，避免 show 线程崩溃
+                    if not isinstance(info, (list, tuple)) or len(info) < 5:
+                        print(f"  - 本域{local_dpid} <-> 远程域{remote_dpid} | info格式异常: {info}")
+                        continue
+
+                    port, timestamp, delay, bw, loss = info[:5]
+                    age = time.time() - timestamp if timestamp > 0 else -1
+
                     print(f"  - 本域{local_dpid}(端口{port}) <-> 远程域{remote_dpid} | "
                           f"延迟:{delay:.3f}ms | 带宽:{bw:.1f}Mbps | 更新:{age:.1f}秒前")
-            
             # 主机
             total_hosts = sum(len(hosts) for ports in self.host_to_sw_port.values() 
                              for hosts in ports.values())
@@ -1382,14 +1401,33 @@ class TopoAwareness(app_manager.RyuApp):
         try:
             if not msg.data:
                 return
-            
+
             pkt = packet.Packet(msg.data)
             eth = pkt.get_protocol(ethernet.ethernet)
-            if not eth or eth.ethertype != ether_types.ETH_TYPE_LLDP:
+
+            # [MOD-1] 原来是：if not eth or eth.ethertype != LLDP: return
+            #       这里拆开判断，避免 eth 为 None 时还访问 eth.src/eth.dst 导致异常
+            if not eth:
+                return
+            if eth.ethertype != ether_types.ETH_TYPE_LLDP:
                 return
 
+            # [MOD-2] 新增：只要确认是 LLDP，就打印一个入口调试日志（dpid / 入端口 / src dst / 帧长）
+            in_port = msg.match.get('in_port', -1)
+            self.logger.info(
+                "[DBG-LLDP] dpid=%s in_port=%s src=%s dst=%s len=%s",
+                format(datapath.id, "016x"), in_port,
+                eth.src, eth.dst, len(msg.data)
+            )
+
             lldp_pkt = pkt.get_protocol(lldp.lldp)
+
+            # [MOD-3] 新增：仅在 LLDP 解析失败时打印 warning，方便确认是不是“标准LLDP但Ryu解析不到”
             if not lldp_pkt:
+                self.logger.warning(
+                    "[DBG-LLDP] dpid=%s in_port=%s: eth_type=LLDP but pkt.get_protocol(lldp.lldp) is None (parse failed)",
+                    format(datapath.id, "016x"), in_port
+                )
                 return
 
             dst_dpid = datapath.id
