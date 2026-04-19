@@ -651,6 +651,64 @@ class TopoAwareness(app_manager.RyuApp):
             self.logger.warning("PortData查询失败: src_dpid=%s, src_port_no=%s, status=%s", 
                               src_dpid, src_port_no, status)
 
+    def _handle_flow_add(self, msg):
+        """
+        收到 server_agent 转发的手动流表下发请求:
+        msg = {
+          "type": "flow_add",
+          "dpid": <int>,
+          "priority": 100,
+          "match": {"in_port": 1},
+          "actions": [{"type":"OUTPUT","port":2}]
+        }
+        """
+        try:
+            dpid = msg.get('dpid')
+            priority = int(msg.get('priority', 100))
+            match_dict = msg.get('match') or {}
+            actions_list = msg.get('actions') or []
+
+            if dpid is None:
+                self.logger.error("flow_add 缺少 dpid: %s", msg)
+                return
+
+            # 确保 datapath 已注册
+            if dpid not in self.dpid_to_switch:
+                self.logger.error("flow_add: 本控制器没有这个交换机 dpid=%s (还没连接或不归我管)", dpid)
+                return
+
+            datapath = self.dpid_to_switch[dpid]
+            parser = datapath.ofproto_parser
+
+            # 1) 解析 match（目前先支持 in_port，后面你想扩展 ipv4_src/dst 也很容易）
+            in_port = match_dict.get('in_port')
+            if in_port is None:
+                self.logger.error("flow_add 缺少 match.in_port: %s", msg)
+                return
+            match = parser.OFPMatch(in_port=int(in_port))
+
+            # 2) 解析 actions（目前先支持 OUTPUT）
+            actions = []
+            for a in actions_list:
+                if not isinstance(a, dict):
+                    continue
+                if a.get('type') == 'OUTPUT':
+                    actions.append(parser.OFPActionOutput(int(a.get('port'))))
+
+            if not actions:
+                self.logger.error("flow_add actions 为空或不支持: %s", msg)
+                return
+
+            # 3) 下发
+            self.add_flow(datapath, priority, match, actions)
+            self.logger.info("flow_add 下发成功: dpid=%s priority=%s match=%s actions=%s",
+                             dpid, priority, match_dict, actions_list)
+            self.logger.warning("flow_add raw dpid=%r type=%s", dpid, type(dpid))
+            self.logger.warning("known dpids=%s", list(self.dpid_to_switch.keys())[:10])
+        except Exception as e:
+            self.logger.error("flow_add 下发失败: %s, msg=%s", e, msg)
+
+
     def _handle_lldp_delay_update(self, response_msg):
         """
         处理根控制器返回的LLDP延迟计算结果
@@ -2300,9 +2358,9 @@ class TopoAwareness(app_manager.RyuApp):
         if not isinstance(msg, dict):
             self.logger.error(f"收到非字典类型消息: {msg}")
             return
-        
+
         msg_type = msg.get('type')
-        
+        self.logger.warning("SERVER_MSG type=%s msg=%s", msg_type, msg)
         # 处理PortData查询请求（来自其他控制器）
         if msg_type == 'portdata_query':
             self._handle_portdata_query(msg)
@@ -2316,6 +2374,11 @@ class TopoAwareness(app_manager.RyuApp):
         # 处理根控制器计算后的LLDP延迟
         if msg_type == 'lldp_delay_update':
             self._handle_lldp_delay_update(msg)
+            return
+
+        # 处理手动下发流表
+        if msg_type == 'flow_add':
+            self._handle_flow_add(msg)
             return
         
         # 处理路径响应

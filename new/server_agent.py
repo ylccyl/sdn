@@ -246,6 +246,55 @@ def get_statistics():
     }
     return jsonify(stats)
 
+
+@app.route('/api/flows/add', methods=['POST'])
+def add_flow():
+    """下发流表（第一版：手动输入端口转发）"""
+    if server_agent is None:
+        return jsonify({'ok': False, 'message': 'Server not initialized'}), 503
+
+    payload = request.get_json(silent=True) or {}
+    # 期望 payload: {dpid, priority, match:{in_port}, actions:[{type:'OUTPUT', port}]}
+    dpid = payload.get('dpid')
+    match = payload.get('match') or {}
+    actions = payload.get('actions') or []
+    priority = payload.get('priority', 100)
+
+    if dpid is None:
+        return jsonify({'ok': False, 'message': 'Missing dpid'}), 400
+    if 'in_port' not in match:
+        return jsonify({'ok': False, 'message': 'Missing match.in_port'}), 400
+    if not actions:
+        return jsonify({'ok': False, 'message': 'Missing actions'}), 400
+
+    app.logger.info(f"add_flow request: dpid={dpid}, priority={priority}, match={match}, actions={actions}")
+    app.logger.info("add_flow controller_to_switches=%s", server_agent.controller_to_switches)
+    app.logger.info("add_flow clients=%s", list(server_agent.clients.keys()))
+
+    # 查找管理该交换机的控制器
+    target_controller = None
+    for controller_key, switches in server_agent.controller_to_switches.items():
+        if dpid in switches:
+            target_controller = controller_key
+            break
+
+    if target_controller is None:
+        return jsonify({'ok': False, 'message': f'Controller not found for switch {dpid}'}), 404
+
+    msg = {
+        "type": "flow_add",
+        "dpid": dpid,
+        "priority": int(priority),
+        "match": match,
+        "actions": actions
+    }
+
+    app.logger.info("add_flow target_controller=%s for dpid=%s", target_controller, dpid)
+    server_agent._send_to_controller(target_controller, msg)
+    app.logger.info("add_flow sent flow_add to %s", target_controller)
+
+    return jsonify({'ok': True, 'sent_to': [target_controller[0], target_controller[1]]})
+
 # ==================== ServerAgent类定义 ====================
 
 class ServerAgent:
@@ -768,6 +817,8 @@ class ServerAgent:
         let network = null;
         let nodes = null;
         let edges = null;
+	let currentNodeId = null;
+	let currentNodeData = null;
         
         // 创建SVG图标（基于lucide-react图标，与SDN.txt保持一致）
         function createIconSVG(iconType, color) {
@@ -801,12 +852,11 @@ class ServerAgent:
                 console.log('vis.js库已加载');
                 
                 const container = document.getElementById('network');
-                nodes = new vis.DataSet([]);
-                edges = new vis.DataSet([]);
+		window.nodes = new vis.DataSet([]);
+		window.edges = new vis.DataSet([]);
                 
                 console.log('DataSet创建完成');
-                
-                const data = { nodes: nodes, edges: edges };
+                const data = { nodes: window.nodes, edges: window.edges };
                 const options = {
                 nodes: {
                     font: {
@@ -882,19 +932,24 @@ class ServerAgent:
             };
             
                 console.log('开始创建vis.Network...');
-                network = new vis.Network(container, data, options);
+		window.network = new vis.Network(container, data, options);
                 console.log('vis.Network创建完成');
                 
                 // 节点点击事件
-                network.on('click', function(params) {
-                    if (params.nodes.length > 0) {
-                        showNodeInfo(params.nodes[0]);
-                        // 确保侧边栏显示
-                        document.getElementById('sidebar').style.display = 'flex';
-                    } else {
-                        // 点击空白处不关闭侧边栏，保持选中状态
-                    }
-                });
+		window.network.on('click', function (params) {
+		  if (params.nodes.length > 0) {
+		    const nodeId = params.nodes[0];
+
+		    showNodeInfo(nodeId);
+
+		    window.currentNodeId = nodeId;
+		    window.currentNodeData = window.nodes.get(nodeId);
+
+		    console.log('currentNodeData:', window.currentNodeData);
+
+		    document.getElementById('sidebar').style.display = 'flex';
+		  }
+		});
                 
                 console.log('事件监听器已设置');
                 
@@ -946,18 +1001,22 @@ class ServerAgent:
         }
         window.refreshTopology = refreshTopology;
         // 更新网络图
-        function updateNetwork(data) {
-            try {
-                const graphNodes = data.nodes || [];
-                const graphEdges = data.edges || [];
-                
-                console.log('收到拓扑数据:', data);
-                console.log('节点数量:', graphNodes.length);
-                console.log('边数量:', graphEdges.length);
-                
-                // 清空现有数据
-                nodes.clear();
-                edges.clear();
+	function updateNetwork(data) {
+	    try {
+		const nodes = window.nodes;
+		const edges = window.edges;
+		if (!nodes || !edges) throw new Error('window.nodes/window.edges not initialized');
+
+		const graphNodes = data.nodes || [];
+		const graphEdges = data.edges || [];
+
+		console.log('收到拓扑数据:', data);
+		console.log('节点数量:', graphNodes.length);
+		console.log('边数量:', graphEdges.length);
+
+		// 清空现有数据
+		nodes.clear();
+		edges.clear();
                 
                 // 添加节点
                 let addedNodes = 0;
@@ -1148,28 +1207,34 @@ class ServerAgent:
         }
         
         // 自定义分层布局函数
-        function applyCustomLayout() {
-            try {
-                console.log('计算自定义布局...');
-                
-                // 收集各层节点（使用nodeType属性而不是shape）
-                const rootNodes = [];
-                const controllerNodes = [];
-                const switchNodes = [];
-                const hostNodes = [];
-                
-                nodes.get().forEach(node => {
-                    const nodeType = node.nodeType || 'unknown';
-                    if (node.id === 'RootController' || nodeType === 'root_controller') {
-                        rootNodes.push(node);
-                    } else if (nodeType === 'controller') {
-                        controllerNodes.push(node);
-                    } else if (nodeType === 'switch') {
-                        switchNodes.push(node);
-                    } else if (nodeType === 'host') {
-                        hostNodes.push(node);
-                    }
-                });
+	function applyCustomLayout() {
+	  try {
+	    console.log('计算自定义布局...');
+
+	    // 关键：统一使用 window 上的 dataset/network，避免外部 nodes 为 null
+	    const nodes = window.nodes;
+	    const edges = window.edges;
+	    const network = window.network;
+	    if (!nodes || !network) throw new Error('window.nodes or window.network not initialized');
+
+	    // 收集各层节点（使用nodeType属性而不是shape）
+	    const rootNodes = [];
+	    const controllerNodes = [];
+	    const switchNodes = [];
+	    const hostNodes = [];
+
+	    nodes.get().forEach(node => {
+	      const nodeType = node.nodeType || 'unknown';
+	      if (node.id === 'RootController' || nodeType === 'root_controller') {
+		rootNodes.push(node);
+	      } else if (nodeType === 'controller') {
+		controllerNodes.push(node);
+	      } else if (nodeType === 'switch') {
+		switchNodes.push(node);
+	      } else if (nodeType === 'host') {
+		hostNodes.push(node);
+	      }
+	    });
                 
                 console.log(`节点分布 - 根:${rootNodes.length}, 从控:${controllerNodes.length}, 交换机:${switchNodes.length}, 主机:${hostNodes.length}`);
                 
@@ -1416,13 +1481,19 @@ class ServerAgent:
         }
         
         // 显示节点信息
-        function showNodeInfo(nodeId) {
-            const node = nodes.get(nodeId);
-            if (!node) return;
-            
-            const nodeType = node.nodeType || 'unknown';
-            const nodeData = node.nodeData || {};
-            const connectionCounts = nodeData.connection_counts || {};
+	function showNodeInfo(nodeId) {
+	    const nodes = window.nodes;          // 关键：用 window.nodes
+	    if (!nodes) {
+		console.error('showNodeInfo: window.nodes is not initialized');
+		return;
+	    }
+
+	    const node = nodes.get(nodeId);
+	    if (!node) return;
+
+	    const nodeType = node.nodeType || 'unknown';
+	    const nodeData = node.nodeData || {};
+	    const connectionCounts = nodeData.connection_counts || {};
             
             // 更新侧边栏标题
             const sidebarTitle = document.getElementById('sidebar-title');
@@ -1621,9 +1692,41 @@ class ServerAgent:
         }
         
         // 显示添加流表模态框（占位函数）
-        function showAddFlowModal() {
-            alert('添加流表功能待实现');
-        }
+	async function showAddFlowModal() {
+	  const node = window.currentNodeData;
+	  if (!node) return alert('请先点击选择一个交换机节点');
+	  if (node.nodeType !== 'switch') return alert(`当前选中的是 ${node.nodeType}，请选交换机(switch)`);
+
+	  const dpid = node.id;
+
+	  const inPort = parseInt(prompt('入口端口 in_port:'), 10);
+	  const outPort = parseInt(prompt('出口端口 out_port:'), 10);
+	  if (!Number.isInteger(inPort) || !Number.isInteger(outPort)) return alert('端口必须是整数');
+
+	  const flow = {
+	    dpid,
+	    priority: 100,
+	    match: { in_port: inPort },
+	    actions: [{ type: 'OUTPUT', port: outPort }]
+	  };
+
+	  console.log('POST /api/flows/add payload:', flow);
+
+	  const resp = await fetch('/api/flows/add', {
+	    method: 'POST',
+	    headers: { 'Content-Type': 'application/json' },
+	    body: JSON.stringify(flow)
+	  });
+
+	  const result = await resp.json().catch(() => ({}));
+	  if (!resp.ok || result.ok === false) {
+	    console.error('add flow failed:', result);
+	    return alert('下发失败: ' + (result.message || resp.statusText));
+	  }
+
+	  alert('下发成功（目前后端只是接收并返回 ok）');
+	}
+	window.showAddFlowModal = showAddFlowModal;
 
 
 		// 删除流表项（占位函数）
@@ -2208,6 +2311,7 @@ class ServerAgent:
         # 转发查询请求到目标控制器
         logger.debug(f"转发PortData查询请求到控制器 {target_controller}")
         self._send_to_controller(target_controller, message)
+        logger.info("add_flow target_controller=%s for dpid=%s", target_controller, dpid)
     
     def handle_portdata_response(self, client_addr, message):
         """
