@@ -120,7 +120,9 @@ class TopoAwareness(app_manager.RyuApp):
         self.measure_thread = hub.spawn(self._detector)   # 启动一个线程，定期执行网络指标的测量任务
         self.monitor_thread = hub.spawn(self._monitor_thread)  # 启动一个线程，定期执行网络监控任务(未启用)
 
-        self.show_info = hub.spawn(self.show)   
+        if self.show_enable:
+             self.show_info = hub.spawn(self.show)
+
         self.check_switch_thread = hub.spawn(self._check_switch_state, self.echo_timestamp)
         self.get_mac_thread = hub.spawn(self.get_local_mac_address)
         self.cleanup_host_thread = hub.spawn(self._cleanup_invalid_hosts)  # 定期清理错误学习的主机
@@ -375,7 +377,7 @@ class TopoAwareness(app_manager.RyuApp):
         while True:
             self._send_echo_request()
             self.add_delay_info()
-            hub.sleep(1)
+            hub.sleep(3)
 
     def _send_echo_request(self):
         """

@@ -295,6 +295,24 @@ def add_flow():
 
     return jsonify({'ok': True, 'sent_to': [target_controller[0], target_controller[1]]})
 
+@app.route('/api/switches/<int:dpid>/ports', methods=['GET'])
+def get_switch_ports(dpid):
+    """返回交换机端口列表（从 server_agent 当前 topo 链路里推断端口号）"""
+    if server_agent is None:
+        return jsonify({'ok': False, 'message': 'Server not initialized'}), 503
+
+    ports = set()
+
+    # server_agent.topo: {(controller_ip, port): [link_info...]}
+    for _ctrl, links in (server_agent.topo or {}).items():
+        for link in (links or []):
+            if link.get('src') == dpid:
+                p = link.get('src_port')
+                if isinstance(p, int):
+                    ports.add(p)
+
+    ports = sorted(ports)
+    return jsonify({'ok': True, 'dpid': dpid, 'ports': ports})
 # ==================== ServerAgent类定义 ====================
 
 class ServerAgent:
@@ -819,7 +837,8 @@ class ServerAgent:
         let edges = null;
 	let currentNodeId = null;
 	let currentNodeData = null;
-        
+        let lastTopoSignature = null;
+
         // 创建SVG图标（基于lucide-react图标，与SDN.txt保持一致）
         function createIconSVG(iconType, color) {
             const svgMap = {
@@ -863,7 +882,7 @@ class ServerAgent:
                         size: 12,
                         color: '#e2e8f0',
                         face: 'Arial',
-                        bold: true
+                        //bold: true
                     },
                     borderWidth: 2,
                     shadow: {
@@ -910,14 +929,15 @@ class ServerAgent:
                         }
                     }
                 },
-                layout: {
-                    hierarchical: {
-                        enabled: false
-                    }
-                },
-                physics: {
-                    enabled: false
-                },
+			layout: {
+			  hierarchical: {
+			    enabled: false
+			  }
+			},
+			physics: {
+			  enabled: false
+			},
+
                 interaction: {
                     hover: true,
                     tooltipDelay: 100,
@@ -1013,6 +1033,16 @@ class ServerAgent:
 		console.log('收到拓扑数据:', data);
 		console.log('节点数量:', graphNodes.length);
 		console.log('边数量:', graphEdges.length);
+
+		// === 拓扑签名：用于判断是否需要重新布局 ===
+		const nodeIds = graphNodes.map(n => (n.id || n)).sort();
+		const edgePairs = graphEdges.map(e => `${e.source}->${e.target}`).sort();
+		const topoSignature = nodeIds.join('|') + '||' + edgePairs.join('|');
+
+		const topoChanged = (topoSignature !== lastTopoSignature);
+		lastTopoSignature = topoSignature;
+
+		console.log('topoChanged =', topoChanged);
 
 		// 清空现有数据
 		nodes.clear();
@@ -1185,21 +1215,17 @@ class ServerAgent:
                 console.log('已添加边数:', addedEdges, '/', graphEdges.length);
                 
                 // 应用自定义分层布局
-                console.log('开始应用自定义分层布局...');
-                applyCustomLayout();
-                
-                // 触发网络图更新
-                if (network) {
-                    setTimeout(() => {
-                        network.fit({
-                            animation: {
-                                duration: 500,
-                                easingFunction: 'easeInOutQuad'
-                            }
-                        });
-                    }, 100);
-                }
-                
+		if (topoChanged) {
+		  console.log('开始应用自定义分层布局...');
+		  // applyCustomLayout();
+
+		  // 只在拓扑变化时做一次 fit（否则每次刷新都动画会卡）
+		if (window.network) {
+  		window.network.fit({ animation: false });
+		}
+		} else {
+		  console.log('拓扑未变化，跳过布局与fit');
+		}
                 console.log('拓扑布局完成');
             } catch (err) {
                 console.error('updateNetwork失败:', err);
@@ -1691,7 +1717,7 @@ class ServerAgent:
             document.getElementById('sidebar').style.display = 'none';
         }
         
-        // 显示添加流表模态框（占位函数）
+       // 显示添加流表模态框（简化版：自动拉端口列表 + 下拉选择）
 	async function showAddFlowModal() {
 	  const node = window.currentNodeData;
 	  if (!node) return alert('请先点击选择一个交换机节点');
@@ -1699,9 +1725,23 @@ class ServerAgent:
 
 	  const dpid = node.id;
 
-	  const inPort = parseInt(prompt('入口端口 in_port:'), 10);
-	  const outPort = parseInt(prompt('出口端口 out_port:'), 10);
-	  if (!Number.isInteger(inPort) || !Number.isInteger(outPort)) return alert('端口必须是整数');
+	  // 1) 拉取端口列表
+	  const portsResp = await fetch(`/api/switches/${encodeURIComponent(dpid)}/ports`);
+	  const portsJson = await portsResp.json().catch(() => ({}));
+	  if (!portsResp.ok || portsJson.ok === false) {
+	    return alert('获取端口列表失败: ' + (portsJson.message || portsResp.statusText));
+	  }
+	  const ports = (portsJson.ports || []).map(Number).filter(Number.isFinite);
+
+	  if (ports.length === 0) return alert(`交换机 ${dpid} 没有可用端口数据`);
+
+	  // 2) 让用户从列表里选 in/out（先用最简单的 prompt 但不手输数字）
+	  const inPort = parseInt(prompt(`选择入口端口 in_port（可选: ${ports.join(', ')}）:`), 10);
+	  const outPort = parseInt(prompt(`选择出口端口 out_port（可选: ${ports.join(', ')}）:`), 10);
+
+	  if (!ports.includes(inPort) || !ports.includes(outPort)) {
+	    return alert('请选择端口列表中的端口号');
+	  }
 
 	  const flow = {
 	    dpid,
@@ -1709,8 +1749,6 @@ class ServerAgent:
 	    match: { in_port: inPort },
 	    actions: [{ type: 'OUTPUT', port: outPort }]
 	  };
-
-	  console.log('POST /api/flows/add payload:', flow);
 
 	  const resp = await fetch('/api/flows/add', {
 	    method: 'POST',
@@ -1720,16 +1758,15 @@ class ServerAgent:
 
 	  const result = await resp.json().catch(() => ({}));
 	  if (!resp.ok || result.ok === false) {
-	    console.error('add flow failed:', result);
 	    return alert('下发失败: ' + (result.message || resp.statusText));
 	  }
 
-	  alert('下发成功（目前后端只是接收并返回 ok）');
+	  alert(`下发成功: dpid=${dpid} in_port=${inPort} -> out_port=${outPort}`);
 	}
 	window.showAddFlowModal = showAddFlowModal;
 
 
-		// 删除流表项（占位函数）
+	// 删除流表项（占位函数）
         function deleteFlow(switchId, flowId) {
             if (confirm('确定要删除这条流表规则吗？')) {
                 console.log('删除流表:', switchId, flowId);
