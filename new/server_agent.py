@@ -837,7 +837,6 @@ class ServerAgent:
         let edges = null;
 	let currentNodeId = null;
 	let currentNodeData = null;
-        let lastTopoSignature = null;
 
         // 创建SVG图标（基于lucide-react图标，与SDN.txt保持一致）
         function createIconSVG(iconType, color) {
@@ -1020,219 +1019,200 @@ class ServerAgent:
             }
         }
         window.refreshTopology = refreshTopology;
-        // 更新网络图
-	function updateNetwork(data) {
-	    try {
-		const nodes = window.nodes;
-		const edges = window.edges;
-		if (!nodes || !edges) throw new Error('window.nodes/window.edges not initialized');
+		// 更新网络图
+function updateNetwork(data) {
+  try {
+    const nodes = window.nodes;
+    const edges = window.edges;
+    if (!nodes || !edges) throw new Error('window.nodes/window.edges not initialized');
 
-		const graphNodes = data.nodes || [];
-		const graphEdges = data.edges || [];
+    const graphNodes = data.nodes || [];
+    const graphEdges = data.edges || [];
 
-		console.log('收到拓扑数据:', data);
-		console.log('节点数量:', graphNodes.length);
-		console.log('边数量:', graphEdges.length);
+    console.log('收到拓扑数据:', data);
+    console.log('节点数量:', graphNodes.length);
+    console.log('边数量:', graphEdges.length);
 
-		// === 拓扑签名：用于判断是否需要重新布局 ===
-		const nodeIds = graphNodes.map(n => (n.id || n)).sort();
-		const edgePairs = graphEdges.map(e => `${e.source}->${e.target}`).sort();
-		const topoSignature = nodeIds.join('|') + '||' + edgePairs.join('|');
+    // 清空现有数据
+    nodes.clear();
+    edges.clear();
 
-		const topoChanged = (topoSignature !== lastTopoSignature);
-		lastTopoSignature = topoSignature;
+    // ===== 添加节点（保持你原来的逐个 add）=====
+    let addedNodes = 0;
+    const nodeTypeCounters = {
+      root_controller: 0,
+      controller: 0,
+      switch: 0,
+      host: 0,
+      unknown: 0
+    };
 
-		console.log('topoChanged =', topoChanged);
+    graphNodes.forEach((nodeObj, index) => {
+      try {
+        const nodeId = nodeObj.id || nodeObj;
+        const nodeData = nodeObj.data || {};
+        const nodeType = nodeData.node_type || 'unknown';
 
-		// 清空现有数据
-		nodes.clear();
-		edges.clear();
-                
-                // 添加节点
-                let addedNodes = 0;
-                // 按节点类型分组，用于编号
-                const nodeTypeCounters = {
-                    'root_controller': 0,
-                    'controller': 0,
-                    'switch': 0,
-                    'host': 0,
-                    'unknown': 0
-                };
-                
-                graphNodes.forEach((nodeObj, index) => {
-                    try {
-                        // 适配新的数据格式：{id: ..., data: {...}}
-                        const nodeId = nodeObj.id || nodeObj;
-                        const nodeData = nodeObj.data || {};
-                        const nodeType = nodeData.node_type || 'unknown';
-                        
-                        let color, size, iconType, label, nodeNumber, iconColor;
-                        
-                        // 根据节点类型设置样式和编号（使用SDN.txt风格的颜色和图标）
-                        if (nodeId === 'RootController' || nodeType === 'root_controller') {
-                            color = { background: '#92400e', border: '#f59e0b', highlight: { background: '#b45309', border: '#fbbf24' } };
-                            size = 56;  // 对应w-14 h-14 (56px)
-                            iconType = 'globe';
-                            iconColor = '#f59e0b';
-                            nodeTypeCounters['root_controller']++;
-                            nodeNumber = nodeTypeCounters['root_controller'];
-                            label = 'Root ' + nodeNumber;
-                        } else if (nodeType === 'controller') {
-                            color = { background: '#1e3a8a', border: '#3b82f6', highlight: { background: '#1e40af', border: '#60a5fa' } };
-                            size = 56;  // 对应w-14 h-14 (56px)
-                            iconType = 'server';
-                            iconColor = '#60a5fa';
-                            nodeTypeCounters['controller']++;
-                            nodeNumber = nodeTypeCounters['controller'];
-                            label = 'Ctrl-' + nodeNumber;
-                        } else if (nodeType === 'switch') {
-                            color = { background: '#164e63', border: '#06b6d4', highlight: { background: '#155e75', border: '#22d3ee' } };
-                            size = 48;  // 对应w-12 h-12 (48px)
-                            iconType = 'network';
-                            iconColor = '#22d3ee';
-                            nodeTypeCounters['switch']++;
-                            nodeNumber = nodeTypeCounters['switch'];
-                            label = 'SW' + nodeNumber;
-                        } else if (nodeType === 'host') {
-                            color = { background: '#1e293b', border: '#475569', highlight: { background: '#334155', border: '#64748b' } };
-                            size = 32;  // 对应w-8 h-8 (32px)
-                            iconType = 'laptop';
-                            iconColor = '#94a3b8';
-                            nodeTypeCounters['host']++;
-                            nodeNumber = nodeTypeCounters['host'];
-                            label = 'H' + nodeNumber;
-                        } else {
-                            // 未知类型
-                            color = { background: '#1e293b', border: '#64748b', highlight: { background: '#334155', border: '#94a3b8' } };
-                            size = 32;
-                            iconType = 'laptop';
-                            iconColor = '#94a3b8';
-                            nodeTypeCounters['unknown']++;
-                            nodeNumber = nodeTypeCounters['unknown'];
-                            label = 'Unknown' + nodeNumber;
-                        }
-                        
-                        // 创建图标SVG并转换为data URI
-                        const iconSVG = createIconSVG(iconType, iconColor);
-                        const iconDataURI = svgToDataURI(iconSVG);
-                        
-                        console.log(`添加节点 ${index}: ID=${nodeId}, Type=${nodeType}, Label=${label}, Icon=${iconType}`);
-                        
-                        // 存储完整的节点信息，包括原始数据和统计信息
-                        nodes.add({
-                            id: nodeId,
-                            label: label,
-                            color: color,
-                            size: size,
-                            shape: 'image',  // 使用image形状
-                            image: iconDataURI,  // 设置图标
-                            brokenImage: iconDataURI,  // 备用图标
-                            title: label,
-                            nodeType: nodeType,
-                            nodeNumber: nodeNumber,
-                            nodeData: nodeData  // 存储完整的节点数据
-                        });
-                        
-                        addedNodes++;
-                    } catch (err) {
-                        console.error('添加节点失败:', nodeObj, err);
-                    }
-                });
-                
-                console.log('已添加节点数:', addedNodes, '/', graphNodes.length);
-            
-                // 添加边
-                let addedEdges = 0;
-                graphEdges.forEach((edgeObj, index) => {
-                    try {
-                        // 适配新的数据格式：{source: ..., target: ..., data: {...}}
-                        let source, target, edgeData;
-                        
-                        if (edgeObj.source !== undefined && edgeObj.target !== undefined) {
-                            // 新格式
-                            source = edgeObj.source;
-                            target = edgeObj.target;
-                            edgeData = edgeObj.data || {};
-                        } else if (Array.isArray(edgeObj) && edgeObj.length >= 2) {
-                            // 旧格式（兼容）
-                            [source, target, edgeData] = edgeObj;
-                        } else {
-                            console.warn('无效的边格式:', edgeObj);
-                            return;
-                        }
-                        
-                        const edgeType = edgeData?.edge_type || 'unknown';
-                        
-                        let color, width, dashes, smooth;
-                        
-                        if (edgeType === 'controller_connection') {
-                            color = { color: '#d97706', highlight: '#f59e0b', hover: '#fbbf24' };
-                            width = 3;
-                            dashes = [10, 5];
-                            smooth = { type: 'curvedCW', roundness: 0.2 };
-                        } else if (edgeType === 'controller_switch') {
-                            color = { color: '#3b82f6', highlight: '#60a5fa', hover: '#93c5fd' };
-                            width = 2.5;
-                            dashes = [5, 5];
-                            smooth = { type: 'cubicBezier', roundness: 0.3 };
-                        } else if (edgeType === 'host_switch') {
-                            color = { color: '#64748b', highlight: '#94a3b8', hover: '#cbd5e0' };
-                            width = 1.5;
-                            dashes = false;
-                            smooth = { type: 'continuous' };
-                        } else if (edgeType === 'switch_link') {
-                            color = { color: '#06b6d4', highlight: '#22d3ee', hover: '#67e8f9' };
-                            width = 2.5;
-                            dashes = false;
-                            smooth = { type: 'curvedCW', roundness: 0.4 };
-                        } else {
-                            color = { color: '#475569', highlight: '#64748b', hover: '#94a3b8' };
-                            width = 2;
-                            dashes = false;
-                            smooth = { type: 'curvedCW', roundness: 0.2 };
-                        }
-                        
-                        console.log(`添加边 ${index}: ${source} -> ${target} (${edgeType})`);
-                        
-                        edges.add({
-                            id: `edge-${index}`,
-                            from: source,
-                            to: target,
-                            color: color,
-                            width: width,
-                            dashes: dashes,
-                            smooth: smooth,
-                            title: `${source} -> ${target}`,
-                            data: { edge_type: edgeType }  // 保存边类型
-                        });
-                        
-                        addedEdges++;
-                    } catch (err) {
-                        console.error('添加边失败:', edgeObj, err);
-                    }
-                });
-                
-                console.log('已添加边数:', addedEdges, '/', graphEdges.length);
-                
-                // 应用自定义分层布局
-		if (topoChanged) {
-		  console.log('开始应用自定义分层布局...');
-		  // applyCustomLayout();
+        let color, size, iconType, label, nodeNumber, iconColor;
 
-		  // 只在拓扑变化时做一次 fit（否则每次刷新都动画会卡）
-		if (window.network) {
-  		window.network.fit({ animation: false });
-		}
-		} else {
-		  console.log('拓扑未变化，跳过布局与fit');
-		}
-                console.log('拓扑布局完成');
-            } catch (err) {
-                console.error('updateNetwork失败:', err);
-            }
+        if (nodeId === 'RootController' || nodeType === 'root_controller') {
+          color = { background: '#92400e', border: '#f59e0b', highlight: { background: '#b45309', border: '#fbbf24' } };
+          size = 56;
+          iconType = 'globe';
+          iconColor = '#f59e0b';
+          nodeTypeCounters.root_controller++;
+          nodeNumber = nodeTypeCounters.root_controller;
+          label = 'Root ' + nodeNumber;
+        } else if (nodeType === 'controller') {
+          color = { background: '#1e3a8a', border: '#3b82f6', highlight: { background: '#1e40af', border: '#60a5fa' } };
+          size = 56;
+          iconType = 'server';
+          iconColor = '#60a5fa';
+          nodeTypeCounters.controller++;
+          nodeNumber = nodeTypeCounters.controller;
+          label = 'Ctrl-' + nodeNumber;
+        } else if (nodeType === 'switch') {
+          color = { background: '#164e63', border: '#06b6d4', highlight: { background: '#155e75', border: '#22d3ee' } };
+          size = 48;
+          iconType = 'network';
+          iconColor = '#22d3ee';
+          nodeTypeCounters.switch++;
+          nodeNumber = nodeTypeCounters.switch;
+          label = 'SW' + nodeNumber;
+        } else if (nodeType === 'host') {
+          color = { background: '#1e293b', border: '#475569', highlight: { background: '#334155', border: '#64748b' } };
+          size = 32;
+          iconType = 'laptop';
+          iconColor = '#94a3b8';
+          nodeTypeCounters.host++;
+          nodeNumber = nodeTypeCounters.host;
+          label = 'H' + nodeNumber;
+        } else {
+          color = { background: '#1e293b', border: '#64748b', highlight: { background: '#334155', border: '#94a3b8' } };
+          size = 32;
+          iconType = 'laptop';
+          iconColor = '#94a3b8';
+          nodeTypeCounters.unknown++;
+          nodeNumber = nodeTypeCounters.unknown;
+          label = 'Unknown' + nodeNumber;
         }
-        
+
+        const iconSVG = createIconSVG(iconType, iconColor);
+        const iconDataURI = svgToDataURI(iconSVG);
+
+        console.log(`添加节点 ${index}: ID=${nodeId}, Type=${nodeType}, Label=${label}, Icon=${iconType}`);
+
+        nodes.add({
+          id: nodeId,
+          label,
+          color,
+          size,
+          shape: 'image',
+          image: iconDataURI,
+          brokenImage: iconDataURI,
+          title: label,
+          nodeType,
+          nodeNumber,
+          nodeData
+        });
+
+        addedNodes++;
+      } catch (err) {
+        console.error('添加节点失败:', nodeObj, err);
+      }
+    });
+
+    console.log('已添加节点数:', addedNodes, '/', graphNodes.length);
+
+    // ===== 添加边（批量 add）=====
+    const tEdge0 = performance.now();
+    let addedEdges = 0;
+    const edgeBatch = [];
+
+    graphEdges.forEach((edgeObj, index) => {
+      try {
+        let source, target, edgeData;
+
+        if (edgeObj && edgeObj.source !== undefined && edgeObj.target !== undefined) {
+          source = edgeObj.source;
+          target = edgeObj.target;
+          edgeData = edgeObj.data || {};
+        } else if (Array.isArray(edgeObj) && edgeObj.length >= 2) {
+          [source, target, edgeData] = edgeObj;
+          edgeData = edgeData || {};
+        } else {
+          console.warn('无效的边格式:', edgeObj);
+          return;
+        }
+
+        const edgeType = edgeData?.edge_type || 'unknown';
+
+        let color, width, dashes, smooth;
+
+        if (edgeType === 'controller_connection') {
+          color = { color: '#d97706', highlight: '#f59e0b', hover: '#fbbf24' };
+          width = 3;
+          dashes = [10, 5];
+          smooth = { type: 'curvedCW', roundness: 0.2 };
+        } else if (edgeType === 'controller_switch') {
+          color = { color: '#3b82f6', highlight: '#60a5fa', hover: '#93c5fd' };
+          width = 2.5;
+          dashes = [5, 5];
+          smooth = { type: 'cubicBezier', roundness: 0.3 };
+        } else if (edgeType === 'host_switch') {
+          color = { color: '#64748b', highlight: '#94a3b8', hover: '#cbd5e0' };
+          width = 1.5;
+          dashes = false;
+          smooth = { type: 'continuous' };
+        } else if (edgeType === 'switch_link') {
+          color = { color: '#06b6d4', highlight: '#22d3ee', hover: '#67e8f9' };
+          width = 2.5;
+          dashes = false;
+          smooth = { type: 'curvedCW', roundness: 0.4 };
+        } else {
+          color = { color: '#475569', highlight: '#64748b', hover: '#94a3b8' };
+          width = 2;
+          dashes = false;
+          smooth = { type: 'curvedCW', roundness: 0.2 };
+        }
+
+        console.log(`添加边 ${index}: ${source} -> ${target} (${edgeType})`);
+
+        edgeBatch.push({
+          id: `edge-${index}`,
+          from: source,
+          to: target,
+          color,
+          width,
+          dashes,
+          smooth,
+          title: `${source} -> ${target}`,
+          data: { edge_type: edgeType }
+        });
+
+        addedEdges++;
+      } catch (err) {
+        console.error('添加边失败:', edgeObj, err);
+      }
+    });
+
+    edges.add(edgeBatch);
+
+    const tEdge1 = performance.now();
+    console.log('已添加边数:', addedEdges, '/', graphEdges.length);
+    console.log(`edges.add batch: count=${edgeBatch.length} time=${(tEdge1 - tEdge0).toFixed(1)}ms`);
+
+    // ===== 布局 + fit =====
+    console.log('开始应用自定义分层布局...');
+    applyCustomLayout();
+    if (window.network) window.network.fit({ animation: false });
+    console.log('拓扑布局完成');
+  } catch (err) {
+    console.error('updateNetwork失败:', err);
+  }
+}
         // 自定义分层布局函数
+/*
 	function applyCustomLayout() {
 	  try {
 	    console.log('计算自定义布局...');
@@ -1446,7 +1426,214 @@ class ServerAgent:
                 console.error('应用自定义布局失败:', err);
             }
         }
-        
+*/
+
+// 自定义分层布局函数（批量 update 版本）
+function applyCustomLayout() {
+  try {
+    const t0 = performance.now();
+    console.log('计算自定义布局...');
+
+    // 关键：统一使用 window 上的 dataset/network
+    const nodes = window.nodes;
+    const edges = window.edges;
+    const network = window.network;
+    if (!nodes || !network) throw new Error('window.nodes or window.network not initialized');
+
+    // 收集各层节点
+    const rootNodes = [];
+    const controllerNodes = [];
+    const switchNodes = [];
+    const hostNodes = [];
+
+    nodes.get().forEach(node => {
+      const nodeType = node.nodeType || 'unknown';
+      if (node.id === 'RootController' || nodeType === 'root_controller') {
+        rootNodes.push(node);
+      } else if (nodeType === 'controller') {
+        controllerNodes.push(node);
+      } else if (nodeType === 'switch') {
+        switchNodes.push(node);
+      } else if (nodeType === 'host') {
+        hostNodes.push(node);
+      }
+    });
+
+    console.log(`节点分布 - 根:${rootNodes.length}, 从控:${controllerNodes.length}, 交换机:${switchNodes.length}, 主机:${hostNodes.length}`);
+
+    // 构建交换机-主机组（交换机与其连接的主机作为一个整体）
+    const switchGroups = {}; // {switchId: [hostIds]}
+
+    // 找出每个交换机连接的主机
+    edges.get().forEach(edge => {
+      const edgeData = edge.data || {};
+      const fromNode = nodes.get(edge.from);
+      const toNode = nodes.get(edge.to);
+
+      // 检查是否是主机-交换机连接
+      if (
+        edgeData.edge_type === 'host_switch' ||
+        (fromNode && toNode &&
+          ((fromNode.nodeType === 'switch' && toNode.nodeType === 'host') ||
+           (fromNode.nodeType === 'host' && toNode.nodeType === 'switch')))
+      ) {
+        const switchId = (fromNode?.nodeType === 'switch') ? edge.from : edge.to;
+        const hostId = (fromNode?.nodeType === 'host') ? edge.from : edge.to;
+
+        if (switchId && hostId) {
+          if (!switchGroups[switchId]) switchGroups[switchId] = [];
+          if (!switchGroups[switchId].includes(hostId)) switchGroups[switchId].push(hostId);
+        }
+      }
+    });
+
+    console.log('交换机-主机组:', switchGroups);
+
+    // 布局参数（保持与你原来一致）
+    const canvasWidth = 2400;
+    const canvasHeight = 1400;
+    const layerHeight = 350;
+    const nodeSpacing = 250;
+    const maxNodesPerRow = 10;
+    const rowSpacing = 200;
+    const hostOffset = 120;
+
+    // ========== 批量 updates ==========
+    const updates = [];
+
+    // ========== 第0层：根控制器 ==========
+    const rootY = 0;
+    rootNodes.forEach((node, index) => {
+      console.log(`放置根控制器: ${node.id} at (${canvasWidth / 2}, ${rootY})`);
+      updates.push({
+        id: node.id,
+        x: canvasWidth / 2,
+        y: rootY,
+        fixed: true
+      });
+    });
+
+    // ========== 第1层：从控制器 ==========
+    const controllerY = rootY + layerHeight;
+    const controllerCount = controllerNodes.length;
+    const controllerRowCount = Math.ceil(controllerCount / maxNodesPerRow);
+
+    console.log(`放置 ${controllerCount} 个从控制器，分 ${controllerRowCount} 行`);
+
+    controllerNodes.forEach((node, index) => {
+      const rowIndex = Math.floor(index / maxNodesPerRow);
+      const colIndex = index % maxNodesPerRow;
+      const nodesInRow = Math.min(maxNodesPerRow, controllerCount - rowIndex * maxNodesPerRow);
+
+      const rowWidth = (nodesInRow - 1) * nodeSpacing;
+      const startX = (canvasWidth - rowWidth) / 2;
+      const x = startX + colIndex * nodeSpacing;
+      const y = controllerY + rowIndex * rowSpacing;
+
+      console.log(`  从控 ${index}: ${node.id} at (${x}, ${y})`);
+      updates.push({
+        id: node.id,
+        x,
+        y,
+        fixed: true
+      });
+    });
+
+    // ========== 第2层：交换机-主机组 ==========
+    const switchLayerY = controllerY + layerHeight + (controllerRowCount > 1 ? rowSpacing : 0);
+
+    // 创建组列表
+    const groups = [];
+    const assignedHosts = new Set();
+
+    // 每个交换机创建一个组
+    switchNodes.forEach(switchNode => {
+      const group = {
+        switch: switchNode,
+        hosts: switchGroups[switchNode.id] || []
+      };
+      groups.push(group);
+      group.hosts.forEach(hostId => assignedHosts.add(hostId));
+    });
+
+    // 未分配的主机独立成组
+    hostNodes.forEach(hostNode => {
+      if (!assignedHosts.has(hostNode.id)) {
+        groups.push({
+          switch: null,
+          hosts: [hostNode.id]
+        });
+      }
+    });
+
+    console.log(`共 ${groups.length} 个交换机-主机组`);
+
+    const groupCount = groups.length;
+    const groupRowCount = Math.ceil(groupCount / maxNodesPerRow);
+
+    console.log(`开始放置 ${groupCount} 个组，分 ${groupRowCount} 行`);
+
+    groups.forEach((group, index) => {
+      const rowIndex = Math.floor(index / maxNodesPerRow);
+      const colIndex = index % maxNodesPerRow;
+      const groupsInRow = Math.min(maxNodesPerRow, groupCount - rowIndex * maxNodesPerRow);
+
+      const rowWidth = (groupsInRow - 1) * nodeSpacing;
+      const startX = (canvasWidth - rowWidth) / 2;
+      const groupX = startX + colIndex * nodeSpacing;
+      const groupBaseY = switchLayerY + rowIndex * (rowSpacing + hostOffset);
+
+      // 放置交换机
+      if (group.switch) {
+        console.log(`  组 ${index}: 交换机 ${group.switch.id} at (${groupX}, ${groupBaseY}), 主机数: ${group.hosts.length}`);
+        updates.push({
+          id: group.switch.id,
+          x: groupX,
+          y: groupBaseY,
+          fixed: true
+        });
+      }
+
+      // 放置主机
+      const hostCount = group.hosts.length;
+      if (hostCount > 0) {
+        if (hostCount === 1) {
+          updates.push({
+            id: group.hosts[0],
+            x: groupX,
+            y: groupBaseY + hostOffset,
+            fixed: true
+          });
+        } else {
+          const hostSpacing = 80;
+          const hostRowWidth = (hostCount - 1) * hostSpacing;
+          const hostStartX = groupX - hostRowWidth / 2;
+
+          group.hosts.forEach((hostId, hostIndex) => {
+            const hostX = hostStartX + hostIndex * hostSpacing;
+            const hostY = groupBaseY + hostOffset;
+
+            updates.push({
+              id: hostId,
+              x: hostX,
+              y: hostY,
+              fixed: true
+            });
+          });
+        }
+      }
+    });
+
+    const t1 = performance.now();
+    // 一次性更新所有节点坐标
+    nodes.update(updates);
+    const t2 = performance.now();
+
+    console.log(`自定义布局应用完成: compute=${(t1 - t0).toFixed(1)}ms, nodes.update batch=${(t2 - t1).toFixed(1)}ms, total=${(t2 - t0).toFixed(1)}ms, updates=${updates.length}`);
+  } catch (err) {
+    console.error('应用自定义布局失败:', err);
+  }
+}
         // 更新统计信息
         async function updateStatistics() {
             try {
