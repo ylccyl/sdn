@@ -19,6 +19,7 @@ from tkinter import ttk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
+import uuid
 
 # 配置日志
 logging.basicConfig(
@@ -38,6 +39,26 @@ WEB_PORT = 5000  # REST API 端口
 
 # 创建 Flask 应用
 app = Flask(__name__)
+
+# 全局意图规则：MVP 只做 ALLOW + IPv4 src/dst + 单向
+INTENT_RULES = {}          # rule_id -> rule dict
+INTENT_RULE_STATUS = {}    # rule_id -> status dict
+
+def _now_ts():
+    return time.time()
+
+def _new_rule_id():
+    # 简单可读；也可以换成 uuid.uuid4().hex
+    return f"R-{uuid.uuid4().hex[:10]}"
+
+def _init_rule_status(rule_id: str):
+    INTENT_RULE_STATUS[rule_id] = {
+        "rule_id": rule_id,
+        "state": "PENDING",          # PENDING | APPLIED | APPLIED_PARTIAL | ERROR (Step 1 先用 PENDING)
+        "message": "created (not deployed yet)",
+        "per_switch": {},            # dpid -> {status, error}
+        "updated_at": _now_ts(),
+    }
 
 # 启用 CORS，允许所有来源
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -313,6 +334,184 @@ def get_switch_ports(dpid):
 
     ports = sorted(ports)
     return jsonify({'ok': True, 'dpid': dpid, 'ports': ports})
+
+from flask import request, jsonify
+
+@app.route('/api/intent/rules', methods=['POST'])
+def api_create_intent_rule():
+    """
+    MVP: 创建一条全局意图规则
+    body:
+      {
+        "ipv4_src": "10.0.0.1",
+        "ipv4_dst": "10.0.0.9"
+      }
+    """
+    data = request.get_json(silent=True) or {}
+    ipv4_src = (data.get("ipv4_src") or "").strip()
+    ipv4_dst = (data.get("ipv4_dst") or "").strip()
+
+    if not ipv4_src or not ipv4_dst:
+        return jsonify({"status": "error", "message": "ipv4_src and ipv4_dst are required"}), 400
+
+    # 最简单的 IPv4 校验（MVP 够用）
+    import ipaddress
+    try:
+        ipaddress.ip_address(ipv4_src)
+        ipaddress.ip_address(ipv4_dst)
+    except ValueError:
+        return jsonify({"status": "error", "message": "invalid ipv4_src or ipv4_dst"}), 400
+
+    rule_id = _new_rule_id()
+    rule = {
+        "rule_id": rule_id,
+        "type": "ALLOW",
+        "direction": "uni",
+        "priority": 1000,
+        "match": {
+            "eth_type": 0x0800,      # IPv4
+            "ipv4_src": ipv4_src,
+            "ipv4_dst": ipv4_dst,
+        },
+        "created_at": _now_ts(),
+        "updated_at": _now_ts(),
+        "spec_version": 1,
+    }
+
+    INTENT_RULES[rule_id] = rule
+    _init_rule_status(rule_id)
+
+    return jsonify({"status": "ok", "rule": rule, "rule_status": INTENT_RULE_STATUS[rule_id]}), 201
+
+
+@app.route('/api/intent/rules', methods=['GET'])
+def api_list_intent_rules():
+    rules = list(INTENT_RULES.values())
+    # 也返回状态摘要，方便前端列表展示
+    out = []
+    for r in rules:
+        rid = r["rule_id"]
+        st = INTENT_RULE_STATUS.get(rid, {})
+        out.append({
+            "rule": r,
+            "status": {
+                "state": st.get("state", "UNKNOWN"),
+                "message": st.get("message", ""),
+                "updated_at": st.get("updated_at", None),
+            }
+        })
+    return jsonify({"status": "ok", "data": out})
+
+
+@app.route('/api/intent/rules/<rule_id>', methods=['GET'])
+def api_get_intent_rule(rule_id):
+    rule = INTENT_RULES.get(rule_id)
+    if not rule:
+        return jsonify({"status": "error", "message": f"rule not found: {rule_id}"}), 404
+    st = INTENT_RULE_STATUS.get(rule_id, {
+        "rule_id": rule_id,
+        "state": "UNKNOWN",
+        "message": "no status",
+        "per_switch": {},
+        "updated_at": None,
+    })
+    return jsonify({"status": "ok", "rule": rule, "rule_status": st})
+
+@app.route('/api/intent/rules/<rule_id>/deploy', methods=['POST'])
+def api_deploy_intent_rule(rule_id):
+    if server_agent is None:
+        return jsonify({"status": "error", "message": "Server not initialized"}), 503
+
+    rule = INTENT_RULES.get(rule_id)
+    if not rule:
+        return jsonify({"status": "error", "message": f"rule not found: {rule_id}"}), 404
+
+    st = INTENT_RULE_STATUS.get(rule_id)
+    if not st:
+        _init_rule_status(rule_id)
+        st = INTENT_RULE_STATUS[rule_id]
+
+    ipv4_src = rule["match"]["ipv4_src"]
+    ipv4_dst = rule["match"]["ipv4_dst"]
+
+    # 1) 用现成的图直接算 host->host 路径（包含 host + switch 节点）
+    try:
+        path = nx.shortest_path(server_agent.G, ipv4_src, ipv4_dst, weight='weight')
+    except Exception as e:
+        st["state"] = "ERROR"
+        st["message"] = f"no path or calc error: {e}"
+        st["updated_at"] = _now_ts()
+        return jsonify({"status": "error", "message": st["message"], "rule_status": st}), 500
+
+    # 2) 从路径里提取交换机 hops（int 的节点就是 dpid）
+    hops = [n for n in path if isinstance(n, int)]
+    if not hops:
+        st["state"] = "ERROR"
+        st["message"] = f"no switch hops in path={path}"
+        st["updated_at"] = _now_ts()
+        return jsonify({"status": "error", "message": st["message"], "rule_status": st}), 500
+
+    st["state"] = "DEPLOYING"
+    st["message"] = f"deploying: path={path}"
+    st["per_switch"] = {}
+    st["updated_at"] = _now_ts()
+
+    # 构建 (src_dpid, dst_dpid) -> src_port 映射
+    link_map = server_agent._build_link_outport_map()
+
+    # 找到 dst host 的接入端口（最后一跳交换机 -> host port）
+    dst_host_port = None
+    for _ctrl, hosts in (server_agent.host or {}).items():
+        for h in (hosts or []):
+            if h.get("ip") == ipv4_dst:
+                dst_host_port = h.get("port")
+                break
+        if dst_host_port is not None:
+            break
+
+    if not isinstance(dst_host_port, int):
+        st["state"] = "ERROR"
+        st["message"] = f"dst host port not found for {ipv4_dst}"
+        st["updated_at"] = _now_ts()
+        return jsonify({"status": "error", "message": st["message"], "rule_status": st}), 500
+
+    # 对每台交换机计算 out_port 并发送 flow_add
+    for idx, dpid in enumerate(hops):
+        ctrl = server_agent._find_controller_for_switch(dpid)
+        if ctrl is None:
+            st["per_switch"][str(dpid)] = {"status": "error", "error": "controller not found for switch"}
+            continue
+
+        # 计算 out_port
+        if idx < len(hops) - 1:
+            nxt = hops[idx + 1]
+            out_port = link_map.get((dpid, nxt))
+            if not isinstance(out_port, int):
+                st["per_switch"][str(dpid)] = {"status": "error", "error": f"no link out_port for ({dpid}->{nxt})"}
+                continue
+        else:
+            out_port = int(dst_host_port)
+
+        msg = {
+            "type": "flow_add",
+            "dpid": dpid,
+            "priority": int(rule.get("priority", 1000)),
+            "match": {
+                "eth_type": 0x0800,
+                "ipv4_src": ipv4_src,
+                "ipv4_dst": ipv4_dst,
+            },
+            "actions": [{"type": "OUTPUT", "port": int(out_port)}],
+            "rule_id": rule_id
+        }
+
+        # 发送到管理该交换机的从控
+        server_agent._send_to_controller(ctrl, msg)
+        st["per_switch"][str(dpid)] = {"status": "sent", "error": "", "out_port": int(out_port)}
+
+    st["updated_at"] = _now_ts()
+    return jsonify({"status": "ok", "rule_id": rule_id, "path": path, "hops": hops, "rule_status": st})
+
 # ==================== ServerAgent类定义 ====================
 
 class ServerAgent:
@@ -2629,7 +2828,25 @@ function applyCustomLayout() {
                 self._send_to_controller(target, resp)
 
         logger.debug(f"LLDP延迟计算完成并分发: {resp}, targets={targets}")
-    
+
+    def _build_link_outport_map(self):
+        """从 self.topo 构建 (src_dpid, dst_dpid) -> src_port 的映射"""
+        m = {}
+        for _ctrl, links in (self.topo or {}).items():
+            for link in (links or []):
+                src = link.get("src")
+                dst = link.get("dst")
+                src_port = link.get("src_port")
+                if isinstance(src, int) and isinstance(dst, int) and isinstance(src_port, int):
+                    m[(src, dst)] = src_port
+        return m
+
+    def _find_controller_for_switch(self, dpid):
+        """根据 dpid 查找管理该交换机的控制器地址 (ip, port)"""
+        for controller_key, switches in self.controller_to_switches.items():
+            if dpid in switches:
+                return controller_key
+        return None
     def _send_to_controller(self, controller_addr, message):
         """
         向指定控制器发送消息
