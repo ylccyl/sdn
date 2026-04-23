@@ -665,7 +665,7 @@ class TopoAwareness(app_manager.RyuApp):
         }
         """
         try:
-            dpid = msg.get('dpid')
+            dpid = int(msg.get("dpid"))
             priority = int(msg.get('priority', 100))
             match_dict = msg.get('match') or {}
             actions_list = msg.get('actions') or []
@@ -682,12 +682,32 @@ class TopoAwareness(app_manager.RyuApp):
             datapath = self.dpid_to_switch[dpid]
             parser = datapath.ofproto_parser
 
-            # 1) 解析 match（目前先支持 in_port，后面你想扩展 ipv4_src/dst 也很容易）
-            in_port = match_dict.get('in_port')
-            if in_port is None:
-                self.logger.error("flow_add 缺少 match.in_port: %s", msg)
+            # 1) 解析 match：兼容两种格式
+            #   A) 旧格式：{"in_port": 1}
+            #   B) 你现在 root 发的格式：{"eth_type":2048, "ipv4_src":"10.0.0.1", "ipv4_dst":"10.0.0.9"}
+            match_kwargs = {}
+
+            in_port = match_dict.get("in_port")
+            if in_port is not None:
+                match_kwargs["in_port"] = int(in_port)
+
+            eth_type = match_dict.get("eth_type")
+            if eth_type is not None:
+                match_kwargs["eth_type"] = int(eth_type)
+
+            ipv4_src = match_dict.get("ipv4_src")
+            if ipv4_src:
+                match_kwargs["ipv4_src"] = ipv4_src
+
+            ipv4_dst = match_dict.get("ipv4_dst")
+            if ipv4_dst:
+                match_kwargs["ipv4_dst"] = ipv4_dst
+
+            if not match_kwargs:
+                self.logger.error("flow_add match 为空或不支持: %s", msg)
                 return
-            match = parser.OFPMatch(in_port=int(in_port))
+
+            match = parser.OFPMatch(**match_kwargs)
 
             # 2) 解析 actions（目前先支持 OUTPUT）
             actions = []
@@ -705,10 +725,37 @@ class TopoAwareness(app_manager.RyuApp):
             self.add_flow(datapath, priority, match, actions)
             self.logger.info("flow_add 下发成功: dpid=%s priority=%s match=%s actions=%s",
                              dpid, priority, match_dict, actions_list)
+            # 回 root：flow_add_result (ok)
+            try:
+                rule_id = msg.get("rule_id")
+                dpid = msg.get("dpid")
+                resp = {
+                    "type": "flow_add_result",
+                    "rule_id": rule_id,
+                    "dpid": dpid,
+                    "status": "ok",
+                }
+                self.server_socket.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+            except Exception as e2:
+                self.logger.error("发送 flow_add_result(ok) 失败: %s", e2)
             self.logger.warning("flow_add raw dpid=%r type=%s", dpid, type(dpid))
             self.logger.warning("known dpids=%s", list(self.dpid_to_switch.keys())[:10])
         except Exception as e:
             self.logger.error("flow_add 下发失败: %s, msg=%s", e, msg)
+            # 回 root：flow_add_result (error)
+            try:
+                rule_id = msg.get("rule_id")
+                dpid = msg.get("dpid")
+                resp = {
+                    "type": "flow_add_result",
+                    "rule_id": rule_id,
+                    "dpid": dpid,
+                    "status": "error",
+                    "error": str(e),
+                }
+                self.server_socket.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+            except Exception as e2:
+                self.logger.error("发送 flow_add_result(error) 失败: %s", e2)
 
 
     def _handle_lldp_delay_update(self, response_msg):

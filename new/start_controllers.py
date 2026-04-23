@@ -37,7 +37,8 @@ class ControllerManager:
         import tempfile
         tmp_dir = Path(tempfile.gettempdir())
         self.pid_file = tmp_dir / 'ryu_controllers.pid'
-        self.log_dir = tmp_dir
+        self.log_dir = Path(__file__).resolve().parent / "logs"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         self.use_terminal = use_terminal
         self.terminal_cmd = self._detect_terminal()
     

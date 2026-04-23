@@ -2923,8 +2923,8 @@ function applyCustomLayout() {
             
             self.G.add_node(controller_id, node_type='controller', ip=ip, port=port)
             # 从控制器连接到根控制器
-            self.G.add_edge(root_controller_id, controller_id, 
-                          edge_type='controller_connection', weight=1)
+            self.G.add_edge(root_controller_id, controller_id,
+                           edge_type='controller_connection', weight=1)
             logger.info(f"添加控制器节点: {controller_id} (IP: {ip}, Port: {port})")
         
         # 添加拓扑链路
@@ -2950,60 +2950,65 @@ function applyCustomLayout() {
                 # 适配controller.py发送的格式
                 src = link.get('src')
                 dst = link.get('dst')
-                if src and dst:
-                    # 先确保节点存在并设置正确的node_type（在添加边之前）
-                    # 这样可以避免NetworkX自动创建没有属性的节点
-                    if src not in self.G:
-                        self.G.add_node(src, node_type='switch')
-                    else:
-                        # 如果节点已存在但没有node_type，则更新它
-                        if 'node_type' not in self.G.nodes[src] or self.G.nodes[src].get('node_type') != 'switch':
-                            self.G.nodes[src]['node_type'] = 'switch'
-                    
-                    if dst not in self.G:
-                        self.G.add_node(dst, node_type='switch')
-                    else:
-                        # 如果节点已存在但没有node_type，则更新它
-                        if 'node_type' not in self.G.nodes[dst] or self.G.nodes[dst].get('node_type') != 'switch':
-                            self.G.nodes[dst]['node_type'] = 'switch'
-                    
-                    # 添加边，可以设置权重等属性
-                    delay = link.get('delay', 1)
-                    bw = link.get('bw', 1)
-                    loss = link.get('loss', 0)
-                    
-                    # 计算权重 (可以根据延迟、带宽和丢包率计算)
-                    # 确保所有值都是有限的，避免产生inf或NaN
-                    import math
-                    if not math.isfinite(delay) or delay < 0:
-                        delay = 1
-                    if not math.isfinite(bw) or bw <= 0:
-                        bw = 1
-                    if not math.isfinite(loss) or loss < 0:
-                        loss = 0
-                    
-                    weight = delay * (1 + loss) / bw
-                    # 确保权重是有限的
-                    if not math.isfinite(weight) or weight < 0:
-                        weight = 1
-                    
-                    self.G.add_edge(src, dst, weight=weight, controller=controller_key,
-                                   delay=delay, bw=bw, loss=loss, edge_type='switch_link')
-                    
-                    # 添加交换机到控制器的连接（如果交换机属于该控制器）
-                    if controller_id in self.G:
-                        # 检查交换机是否属于该控制器
-                        if controller_key in self.controller_to_switches:
-                            if src in self.controller_to_switches[controller_key]:
-                                if not self.G.has_edge(controller_id, src):
-                                    self.G.add_edge(controller_id, src, 
-                                                  edge_type='controller_switch', weight=0.5)
-                            if dst in self.controller_to_switches[controller_key]:
-                                if not self.G.has_edge(controller_id, dst):
-                                    self.G.add_edge(controller_id, dst, 
-                                                  edge_type='controller_switch', weight=0.5)
-                    
-                    logger.info(f"添加边: {src} -> {dst}, 权重: {weight}")
+                if src is None or dst is None:
+                    logger.warning(f"skip invalid link (missing src/dst): {link}")
+                    continue
+                # 先确保节点存在并设置正确的node_type（在添加边之前）
+                # 这样可以避免NetworkX自动创建没有属性的节点
+                if src not in self.G:
+                    self.G.add_node(src, node_type='switch')
+                else:
+                    # 如果节点已存在但没有node_type，则更新它
+                    if 'node_type' not in self.G.nodes[src] or self.G.nodes[src].get('node_type') != 'switch':
+                        self.G.nodes[src]['node_type'] = 'switch'
+                
+                if dst not in self.G:
+                    self.G.add_node(dst, node_type='switch')
+                else:
+                    # 如果节点已存在但没有node_type，则更新它
+                    if 'node_type' not in self.G.nodes[dst] or self.G.nodes[dst].get('node_type') != 'switch':
+                        self.G.nodes[dst]['node_type'] = 'switch'
+                
+                # 添加边，可以设置权重等属性
+                delay = link.get('delay', 1)
+                bw = link.get('bw', 1)
+                loss = link.get('loss', 0)
+                
+                # 计算权重 (可以根据延迟、带宽和丢包率计算)
+                # 确保所有值都是有限的，避免产生inf或NaN
+                import math
+                if not math.isfinite(delay) or delay < 0:
+                    delay = 1
+                if not math.isfinite(bw) or bw <= 0:
+                    bw = 1
+                if not math.isfinite(loss) or loss < 0:
+                    loss = 0
+                
+                weight = delay * (1 + loss) / bw
+                # 确保权重是有限的
+                if not math.isfinite(weight) or weight < 0:
+                    weight = 1
+                
+                self.G.add_edge(src, dst, weight=weight, controller=controller_key,
+                               delay=delay, bw=bw, loss=loss, edge_type='switch_link')
+                # 反向边：保证 DiGraph 可双向寻路（否则容易 No path）
+                self.G.add_edge(dst, src, weight=weight, controller=controller_key,
+                               delay=delay, bw=bw, loss=loss, edge_type='switch_link')
+                
+                # 添加交换机到控制器的连接（如果交换机属于该控制器）
+                if controller_id in self.G:
+                    # 检查交换机是否属于该控制器
+                    if controller_key in self.controller_to_switches:
+                        if src in self.controller_to_switches[controller_key]:
+                            if not self.G.has_edge(controller_id, src):
+                                self.G.add_edge(controller_id, src, 
+                                              edge_type='controller_switch', weight=0.5)
+                        if dst in self.controller_to_switches[controller_key]:
+                            if not self.G.has_edge(controller_id, dst):
+                                self.G.add_edge(controller_id, dst, 
+                                              edge_type='controller_switch', weight=0.5)
+                
+                logger.info(f"添加边: {src} -> {dst}, 权重: {weight}")
         
         # 添加交换机节点（即使没有链路）
         for controller_key, switches in self.controller_to_switches.items():
