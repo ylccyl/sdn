@@ -175,9 +175,39 @@ def get_graph():
                 host_count = sum(1 for n in neighbors 
                                if server_agent.G.nodes[n].get('node_type') == 'host')
                 connection_counts['hosts'] = host_count
+                # ============ 新增：计算该交换机的真实指标 ============
+                node_delay = 0.0
+                node_throughput = 0.0
+                node_loss = 0.0
+                link_count = 0
+                for _, _, edge_data in server_agent.G.edges(node_id, data=True):
+                    if edge_data.get('edge_type') == 'switch_link':
+                        d = edge_data.get('delay', 0)
+                        if d > 0: 
+                            node_delay += d
+                        bw = edge_data.get('bw', 800)
+                        node_throughput += max(0, 800 - bw)
+                        node_loss = max(node_loss, edge_data.get('loss', 0))
+                        link_count += 1
+                
+                if link_count > 0:
+                    node_data['latency'] = round((node_delay / link_count) * 1000, 2)
+                    node_data['throughput'] = round(node_throughput, 2)
+                    node_data['loss'] = round(node_loss * 100, 2)
+                else:
+                    node_data['latency'] = 0.0
+                    node_data['throughput'] = 0.0
+                    node_data['loss'] = 0.0
+                # ====================================================
                 # 获取流表信息（如果有）
-                flow_table = node_data.get('flow_table', [])
+                # ===== 把这里修改为从专属字典读取 =====
+                try:
+                    dpid_int = int(node_id)
+                    flow_table = server_agent.switch_flows.get(dpid_int, [])
+                except (ValueError, TypeError):
+                    flow_table = []
                 node_data['flow_table'] = flow_table
+                # ======================================
                 # 获取网关IP（如果有）
                 gateway_ip = node_data.get('gateway_ip', '')
                 node_data['gateway_ip'] = gateway_ip
@@ -257,16 +287,58 @@ def get_statistics():
     if server_agent is None:
         return jsonify({'error': 'Server not initialized'}), 503
     
+    total_delay = 0.0
+    link_count_for_delay = 0
+    total_throughput = 0.0
+    
+    # 顺便统计每个交换机的独立指标，供侧边栏静默刷新使用
+    switch_metrics = {}
+    for node_id, node_data in server_agent.G.nodes(data=True):
+        if node_data.get('node_type') == 'switch':
+            node_delay = 0.0
+            node_throughput = 0.0
+            node_loss = 0.0
+            link_count = 0
+            for _, _, edge_data in server_agent.G.edges(node_id, data=True):
+                if edge_data.get('edge_type') == 'switch_link':
+                    d = edge_data.get('delay', 0)
+                    if d > 0: node_delay += d
+                    bw = edge_data.get('bw', 800)
+                    node_throughput += max(0, 800 - bw)
+                    node_loss = max(node_loss, edge_data.get('loss', 0))
+                    link_count += 1
+            
+            switch_metrics[str(node_id)] = {
+                'latency': round((node_delay / link_count) * 1000, 2) if link_count > 0 else 0.0,
+                'throughput': round(node_throughput, 2) if link_count > 0 else 0.0,
+                'loss': round(node_loss * 100, 2) if link_count > 0 else 0.0
+            }
+
+    # 统计全局延迟和吞吐
+    for u, v, data in server_agent.G.edges(data=True):
+        if data.get('edge_type') == 'switch_link':
+            d = data.get('delay', 0)
+            if d > 0:
+                total_delay += d
+                link_count_for_delay += 1
+            bw = data.get('bw', 800)
+            total_throughput += max(0, 800 - bw)
+            
+    avg_latency = (total_delay / link_count_for_delay) if link_count_for_delay > 0 else 0.0
+    total_throughput = total_throughput / 2 
+    
     stats = {
         'controllers': len(server_agent.clients),
         'switches': sum(len(switches) for switches in server_agent.controller_to_switches.values()),
         'links': sum(len(links) for links in server_agent.topo.values()),
         'hosts': sum(len(hosts) for hosts in server_agent.host.values()),
         'graph_nodes': len(server_agent.G.nodes()),
-        'graph_edges': len(server_agent.G.edges())
+        'graph_edges': len(server_agent.G.edges()),
+        'avg_latency': round(avg_latency * 1000, 2),
+        'total_throughput': round(total_throughput, 2),
+        'switch_metrics': switch_metrics  # 【新增】发给前端
     }
     return jsonify(stats)
-
 
 @app.route('/api/flows/add', methods=['POST'])
 def add_flow():
@@ -313,7 +385,24 @@ def add_flow():
     app.logger.info("add_flow target_controller=%s for dpid=%s", target_controller, dpid)
     server_agent._send_to_controller(target_controller, msg)
     app.logger.info("add_flow sent flow_add to %s", target_controller)
-
+    
+     # ===== 新增：立刻将手动下发的流表写入图节点，前端一刷新就能看见 =====
+    dpid_key = dpid if dpid in server_agent.G.nodes else (str(dpid) if str(dpid) in server_agent.G.nodes else (int(dpid) if int(dpid) in server_agent.G.nodes else None))
+    if dpid_key is not None:
+        if 'flow_table' not in server_agent.G.nodes[dpid_key]:
+            server_agent.G.nodes[dpid_key]['flow_table'] = []
+            
+        in_port = match.get('in_port', '*')
+        out_port = actions[0].get('port', '*') if actions else '*'
+        
+        server_agent.G.nodes[dpid_key]['flow_table'].append({
+            'id': manual_rule_id,
+            'priority': int(priority),
+            'match': f"in_port={in_port}",
+            'action': f"OUTPUT : {out_port}",
+            'packets': 0
+        })
+    # ==========================================================
     return jsonify({'ok': True, 'sent_to': [target_controller[0], target_controller[1]]})
 
 @app.route('/api/switches/<int:dpid>/ports', methods=['GET'])
@@ -444,7 +533,7 @@ def api_deploy_intent_rule(rule_id):
         return jsonify({"status": "error", "message": st["message"], "rule_status": st}), 500
 
     # 2) 从路径里提取交换机 hops（int 的节点就是 dpid）
-    hops = [n for n in path if isinstance(n, int)]
+    hops = [n for n in path if str(n).isdigit()]
     if not hops:
         st["state"] = "ERROR"
         st["message"] = f"no switch hops in path={path}"
@@ -483,11 +572,12 @@ def api_deploy_intent_rule(rule_id):
             continue
 
         # 计算 out_port
+        dpid_int = int(dpid)
         if idx < len(hops) - 1:
-            nxt = hops[idx + 1]
-            out_port = link_map.get((dpid, nxt))
-            if not isinstance(out_port, int):
-                st["per_switch"][str(dpid)] = {"status": "error", "error": f"no link out_port for ({dpid}->{nxt})"}
+            nxt_int = int(hops[idx + 1])
+            out_port = link_map.get((dpid_int, nxt_int))
+            if out_port is None:
+                st["per_switch"][str(dpid)] = {"status": "error", "error": f"未找到链路 ({dpid_int}->{nxt_int}) 的出端口"}
                 continue
         else:
             out_port = int(dst_host_port)
@@ -541,7 +631,11 @@ class ServerAgent:
         
         # 用于路径计算的图
         self.G = nx.DiGraph()
-        
+       
+        # ===== 新增：独立持久化存储交换机的流表 =====
+        self.switch_flows = {}  # {dpid_int: [flow_list]}
+        # ============================================
+
         # 启动定时打印线程（使用单独的线程而不是hub）
         self.print_thread = threading.Thread(target=self.print_topo_info_loop)
         self.print_thread.daemon = True
@@ -918,27 +1012,33 @@ class ServerAgent:
             padding: 4px 6px;
             border-radius: 4px;
         }
-        .btn-add-flow {
-            font-size: 12px;
-            background: #2563eb;
-            color: white;
-            padding: 6px 12px;
-            border-radius: 6px;
-            border: none;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            transition: all 0.2s;
-            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);
+                /* === 弹窗 (Modal) 样式 === */
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(2, 6, 23, 0.8); backdrop-filter: blur(4px);
+            display: none; justify-content: center; align-items: center; z-index: 1000;
+            opacity: 0; transition: opacity 0.2s ease;
         }
-        .btn-add-flow:hover {
-            background: #1d4ed8;
-            transform: scale(0.98);
+        .modal-overlay.show { display: flex; opacity: 1; }
+        .modal-content {
+            background: #0f172a; border: 1px solid #1e293b; border-radius: 12px;
+            width: 380px; padding: 24px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+            transform: scale(0.95); transition: transform 0.2s ease;
         }
-        .btn-add-flow:active {
-            transform: scale(0.95);
-        }
+        .modal-overlay.show .modal-content { transform: scale(1); }
+        .modal-header { font-size: 18px; font-weight: bold; margin-bottom: 20px; display: flex; justify-content: space-between; color: white; }
+        .modal-close { cursor: pointer; color: #64748b; font-size: 20px; line-height: 20px; }
+        .modal-close:hover { color: white; }
+        .form-group { margin-bottom: 16px; }
+        .form-label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px;}
+        .form-select { width: 100%; background: #1e293b; border: 1px solid #334155; color: white; padding: 10px 12px; border-radius: 6px; outline: none; font-family: monospace; font-size: 14px;}
+        .form-select:focus { border-color: #3b82f6; }
+        .modal-footer { display: flex; justify-content: flex-end; gap: 12px; margin-top: 28px; }
+        .btn-cancel { background: transparent; border: 1px solid #334155; color: #e2e8f0; padding: 8px 16px; border-radius: 6px; cursor: pointer; transition: all 0.2s;}
+        .btn-cancel:hover { background: #1e293b; }
+        .btn-submit { background: #2563eb; border: none; color: white; padding: 8px 16px; border-radius: 6px; cursor: pointer; transition: all 0.2s; font-weight: bold;}
+        .btn-submit:hover { background: #1d4ed8; }
+        .btn-submit:disabled { background: #475569; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -985,6 +1085,13 @@ class ServerAgent:
                         <span class="metric-value">Refresh</span>
                     </div>
                 </div>
+                <!-- 【新增】：全局策略按钮 -->
+                <div class="metric-box" style="cursor: pointer; background: rgba(37, 99, 235, 0.2); border-color: rgba(37, 99, 235, 0.5);" onclick="showIntentModal()" title="Create End-to-End Policy">
+                    <div class="metric-content">
+                        <span class="metric-label" style="color: #60a5fa;">Global Policy</span>
+                        <span class="metric-value" style="color: #93c5fd;">+ New Intent</span>
+                    </div>
+                </div>
             </div>
         </header>
             
@@ -1026,6 +1133,50 @@ class ServerAgent:
                     </svg>
                     <p>Select a node from the topology</p>
                 </div>
+            </div>
+        </div>
+    </div>
+
+        <!-- 【新增】：全局意图配置弹窗 -->
+    <div class="modal-overlay" id="intent-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="intent-modal-title">创建全局策略 (Host-to-Host)</span>
+                <span class="modal-close" onclick="closeIntentModal()">✕</span>
+            </div>
+            <div class="form-group">
+                <label class="form-label">源主机 (Source Host)</label>
+                <select class="form-select" id="intent-src-host"></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">目的主机 (Destination Host)</label>
+                <select class="form-select" id="intent-dst-host"></select>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-cancel" onclick="closeIntentModal()">取消</button>
+                <button class="btn-submit" id="intent-submit-btn" onclick="submitIntentRule()">一键下发全网</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 流表配置弹窗 -->
+    <div class="modal-overlay" id="flow-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span id="flow-modal-title">添加流表规则</span>
+                <span class="modal-close" onclick="closeFlowModal()">✕</span>
+            </div>
+            <div class="form-group">
+                <label class="form-label">入端口 (In_Port)</label>
+                <select class="form-select" id="flow-in-port"></select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">出端口 (Out_Port)</label>
+                <select class="form-select" id="flow-out-port"></select>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-cancel" onclick="closeFlowModal()">取消</button>
+                <button class="btn-submit" id="flow-submit-btn" onclick="submitFlowRule()">下发规则</button>
             </div>
         </div>
     </div>
@@ -1178,6 +1329,8 @@ class ServerAgent:
                 // 自动刷新（每5秒）disable to increase speed
                 //setInterval(refreshTopology, 30000);
                 //console.log('自动刷新已启用（每30秒）');
+                // 【新增】：专门开启一个高频的轻量级定时器，每 3 秒只拉取监控数字
+                setInterval(updateStatistics, 3000);
                 
             } catch (err) {
                 console.error('初始化网络图失败:', err);
@@ -1626,230 +1779,244 @@ function updateNetwork(data) {
             }
         }
 */
+    // 自定义分层布局函数（批量 update 版本)
+    function applyCustomLayout() {
+      try {
+        const t0 = performance.now();
+        console.log('计算自定义布局...');
 
-// 自定义分层布局函数（批量 update 版本）
-function applyCustomLayout() {
-  try {
-    const t0 = performance.now();
-    console.log('计算自定义布局...');
+        // 关键：统一使用 window 上的 dataset/network
+        const nodes = window.nodes;
+        const edges = window.edges;
+        const network = window.network;
+        if (!nodes || !network) throw new Error('window.nodes or window.network not initialized');
 
-    // 关键：统一使用 window 上的 dataset/network
-    const nodes = window.nodes;
-    const edges = window.edges;
-    const network = window.network;
-    if (!nodes || !network) throw new Error('window.nodes or window.network not initialized');
+        // 收集各层节点
+        const rootNodes = [];
+        const controllerNodes = [];
+        const switchNodes = [];
+        const hostNodes = [];
 
-    // 收集各层节点
-    const rootNodes = [];
-    const controllerNodes = [];
-    const switchNodes = [];
-    const hostNodes = [];
-
-    nodes.get().forEach(node => {
-      const nodeType = node.nodeType || 'unknown';
-      if (node.id === 'RootController' || nodeType === 'root_controller') {
-        rootNodes.push(node);
-      } else if (nodeType === 'controller') {
-        controllerNodes.push(node);
-      } else if (nodeType === 'switch') {
-        switchNodes.push(node);
-      } else if (nodeType === 'host') {
-        hostNodes.push(node);
-      }
-    });
-
-    console.log(`节点分布 - 根:${rootNodes.length}, 从控:${controllerNodes.length}, 交换机:${switchNodes.length}, 主机:${hostNodes.length}`);
-
-    // 构建交换机-主机组（交换机与其连接的主机作为一个整体）
-    const switchGroups = {}; // {switchId: [hostIds]}
-
-    // 找出每个交换机连接的主机
-    edges.get().forEach(edge => {
-      const edgeData = edge.data || {};
-      const fromNode = nodes.get(edge.from);
-      const toNode = nodes.get(edge.to);
-
-      // 检查是否是主机-交换机连接
-      if (
-        edgeData.edge_type === 'host_switch' ||
-        (fromNode && toNode &&
-          ((fromNode.nodeType === 'switch' && toNode.nodeType === 'host') ||
-           (fromNode.nodeType === 'host' && toNode.nodeType === 'switch')))
-      ) {
-        const switchId = (fromNode?.nodeType === 'switch') ? edge.from : edge.to;
-        const hostId = (fromNode?.nodeType === 'host') ? edge.from : edge.to;
-
-        if (switchId && hostId) {
-          if (!switchGroups[switchId]) switchGroups[switchId] = [];
-          if (!switchGroups[switchId].includes(hostId)) switchGroups[switchId].push(hostId);
-        }
-      }
-    });
-
-    console.log('交换机-主机组:', switchGroups);
-
-    // 布局参数（保持与你原来一致）
-    const canvasWidth = 2400;
-    const canvasHeight = 1400;
-    const layerHeight = 350;
-    const nodeSpacing = 250;
-    const maxNodesPerRow = 10;
-    const rowSpacing = 200;
-    const hostOffset = 120;
-
-    // ========== 批量 updates ==========
-    const updates = [];
-
-    // ========== 第0层：根控制器 ==========
-    const rootY = 0;
-    rootNodes.forEach((node, index) => {
-      console.log(`放置根控制器: ${node.id} at (${canvasWidth / 2}, ${rootY})`);
-      updates.push({
-        id: node.id,
-        x: canvasWidth / 2,
-        y: rootY,
-        fixed: true
-      });
-    });
-
-    // ========== 第1层：从控制器 ==========
-    const controllerY = rootY + layerHeight;
-    const controllerCount = controllerNodes.length;
-    const controllerRowCount = Math.ceil(controllerCount / maxNodesPerRow);
-
-    console.log(`放置 ${controllerCount} 个从控制器，分 ${controllerRowCount} 行`);
-
-    controllerNodes.forEach((node, index) => {
-      const rowIndex = Math.floor(index / maxNodesPerRow);
-      const colIndex = index % maxNodesPerRow;
-      const nodesInRow = Math.min(maxNodesPerRow, controllerCount - rowIndex * maxNodesPerRow);
-
-      const rowWidth = (nodesInRow - 1) * nodeSpacing;
-      const startX = (canvasWidth - rowWidth) / 2;
-      const x = startX + colIndex * nodeSpacing;
-      const y = controllerY + rowIndex * rowSpacing;
-
-      console.log(`  从控 ${index}: ${node.id} at (${x}, ${y})`);
-      updates.push({
-        id: node.id,
-        x,
-        y,
-        fixed: true
-      });
-    });
-
-    // ========== 第2层：交换机-主机组 ==========
-    const switchLayerY = controllerY + layerHeight + (controllerRowCount > 1 ? rowSpacing : 0);
-
-    // 创建组列表
-    const groups = [];
-    const assignedHosts = new Set();
-
-    // 每个交换机创建一个组
-    switchNodes.forEach(switchNode => {
-      const group = {
-        switch: switchNode,
-        hosts: switchGroups[switchNode.id] || []
-      };
-      groups.push(group);
-      group.hosts.forEach(hostId => assignedHosts.add(hostId));
-    });
-
-    // 未分配的主机独立成组
-    hostNodes.forEach(hostNode => {
-      if (!assignedHosts.has(hostNode.id)) {
-        groups.push({
-          switch: null,
-          hosts: [hostNode.id]
+        nodes.get().forEach(node => {
+          const nodeType = node.nodeType || 'unknown';
+          if (node.id === 'RootController' || nodeType === 'root_controller') {
+	    rootNodes.push(node);
+          } else if (nodeType === 'controller') {
+	    controllerNodes.push(node);
+          } else if (nodeType === 'switch') {
+	    switchNodes.push(node);
+          } else if (nodeType === 'host') {
+	    hostNodes.push(node);
+          }
         });
-      }
-    });
 
-    console.log(`共 ${groups.length} 个交换机-主机组`);
+        console.log(`节点分布 - 根:${rootNodes.length}, 从控:${controllerNodes.length}, 交换机:${switchNodes.length}, 主机:${hostNodes.length}`);
 
-    const groupCount = groups.length;
-    const groupRowCount = Math.ceil(groupCount / maxNodesPerRow);
+        // 构建交换机-主机组（交换机与其连接的主机作为一个整体）
+        const switchGroups = {}; // {switchId: [hostIds]}
 
-    console.log(`开始放置 ${groupCount} 个组，分 ${groupRowCount} 行`);
+        // 找出每个交换机连接的主机
+        edges.get().forEach(edge => {
+          const edgeData = edge.data || {};
+          const fromNode = nodes.get(edge.from);
+          const toNode = nodes.get(edge.to);
 
-    groups.forEach((group, index) => {
-      const rowIndex = Math.floor(index / maxNodesPerRow);
-      const colIndex = index % maxNodesPerRow;
-      const groupsInRow = Math.min(maxNodesPerRow, groupCount - rowIndex * maxNodesPerRow);
+          // 检查是否是主机-交换机连接
+          if (
+	    edgeData.edge_type === 'host_switch' ||
+	    (fromNode && toNode &&
+	      ((fromNode.nodeType === 'switch' && toNode.nodeType === 'host') ||
+	       (fromNode.nodeType === 'host' && toNode.nodeType === 'switch')))
+          ) {
+	    const switchId = (fromNode?.nodeType === 'switch') ? edge.from : edge.to;
+	    const hostId = (fromNode?.nodeType === 'host') ? edge.from : edge.to;
 
-      const rowWidth = (groupsInRow - 1) * nodeSpacing;
-      const startX = (canvasWidth - rowWidth) / 2;
-      const groupX = startX + colIndex * nodeSpacing;
-      const groupBaseY = switchLayerY + rowIndex * (rowSpacing + hostOffset);
-
-      // 放置交换机
-      if (group.switch) {
-        console.log(`  组 ${index}: 交换机 ${group.switch.id} at (${groupX}, ${groupBaseY}), 主机数: ${group.hosts.length}`);
-        updates.push({
-          id: group.switch.id,
-          x: groupX,
-          y: groupBaseY,
-          fixed: true
+	    if (switchId && hostId) {
+	      if (!switchGroups[switchId]) switchGroups[switchId] = [];
+	      if (!switchGroups[switchId].includes(hostId)) switchGroups[switchId].push(hostId);
+	    }
+          }
         });
-      }
 
-      // 放置主机
-      const hostCount = group.hosts.length;
-      if (hostCount > 0) {
-        if (hostCount === 1) {
+        console.log('交换机-主机组:', switchGroups);
+
+        // 布局参数（保持与你原来一致）
+        const canvasWidth = 2400;
+        const canvasHeight = 1400;
+        const layerHeight = 350;
+        const nodeSpacing = 250;
+        const maxNodesPerRow = 10;
+        const rowSpacing = 200;
+        const hostOffset = 120;
+
+        // ========== 批量 updates ==========
+        const updates = [];
+
+        // ========== 第0层：根控制器 ==========
+        const rootY = 0;
+        rootNodes.forEach((node, index) => {
+          console.log(`放置根控制器: ${node.id} at (${canvasWidth / 2}, ${rootY})`);
           updates.push({
-            id: group.hosts[0],
-            x: groupX,
-            y: groupBaseY + hostOffset,
-            fixed: true
+	    id: node.id,
+	    x: canvasWidth / 2,
+	    y: rootY,
+	    fixed: true
           });
-        } else {
-          const hostSpacing = 80;
-          const hostRowWidth = (hostCount - 1) * hostSpacing;
-          const hostStartX = groupX - hostRowWidth / 2;
+        });
 
-          group.hosts.forEach((hostId, hostIndex) => {
-            const hostX = hostStartX + hostIndex * hostSpacing;
-            const hostY = groupBaseY + hostOffset;
+        // ========== 第1层：从控制器 ==========
+        const controllerY = rootY + layerHeight;
+        const controllerCount = controllerNodes.length;
+        const controllerRowCount = Math.ceil(controllerCount / maxNodesPerRow);
 
-            updates.push({
-              id: hostId,
-              x: hostX,
-              y: hostY,
-              fixed: true
-            });
+        console.log(`放置 ${controllerCount} 个从控制器，分 ${controllerRowCount} 行`);
+
+        controllerNodes.forEach((node, index) => {
+          const rowIndex = Math.floor(index / maxNodesPerRow);
+          const colIndex = index % maxNodesPerRow;
+          const nodesInRow = Math.min(maxNodesPerRow, controllerCount - rowIndex * maxNodesPerRow);
+
+          const rowWidth = (nodesInRow - 1) * nodeSpacing;
+          const startX = (canvasWidth - rowWidth) / 2;
+          const x = startX + colIndex * nodeSpacing;
+          const y = controllerY + rowIndex * rowSpacing;
+
+          console.log(`  从控 ${index}: ${node.id} at (${x}, ${y})`);
+          updates.push({
+	    id: node.id,
+	    x,
+	    y,
+	    fixed: true
           });
-        }
+        });
+
+        // ========== 第2层：交换机-主机组 ==========
+        const switchLayerY = controllerY + layerHeight + (controllerRowCount > 1 ? rowSpacing : 0);
+
+        // 创建组列表
+        const groups = [];
+        const assignedHosts = new Set();
+
+        // 每个交换机创建一个组
+        switchNodes.forEach(switchNode => {
+          const group = {
+	    switch: switchNode,
+	    hosts: switchGroups[switchNode.id] || []
+          };
+          groups.push(group);
+          group.hosts.forEach(hostId => assignedHosts.add(hostId));
+        });
+
+        // 未分配的主机独立成组
+        hostNodes.forEach(hostNode => {
+          if (!assignedHosts.has(hostNode.id)) {
+	    groups.push({
+	      switch: null,
+	      hosts: [hostNode.id]
+	    });
+          }
+        });
+
+        console.log(`共 ${groups.length} 个交换机-主机组`);
+
+        const groupCount = groups.length;
+        const groupRowCount = Math.ceil(groupCount / maxNodesPerRow);
+
+        console.log(`开始放置 ${groupCount} 个组，分 ${groupRowCount} 行`);
+
+        groups.forEach((group, index) => {
+          const rowIndex = Math.floor(index / maxNodesPerRow);
+          const colIndex = index % maxNodesPerRow;
+          const groupsInRow = Math.min(maxNodesPerRow, groupCount - rowIndex * maxNodesPerRow);
+
+          const rowWidth = (groupsInRow - 1) * nodeSpacing;
+          const startX = (canvasWidth - rowWidth) / 2;
+          const groupX = startX + colIndex * nodeSpacing;
+          const groupBaseY = switchLayerY + rowIndex * (rowSpacing + hostOffset);
+
+          // 放置交换机
+          if (group.switch) {
+	    console.log(`  组 ${index}: 交换机 ${group.switch.id} at (${groupX}, ${groupBaseY}), 主机数: ${group.hosts.length}`);
+	    updates.push({
+	      id: group.switch.id,
+	      x: groupX,
+	      y: groupBaseY,
+	      fixed: true
+	    });
+          }
+
+          // 放置主机
+          const hostCount = group.hosts.length;
+          if (hostCount > 0) {
+	    if (hostCount === 1) {
+	      updates.push({
+	        id: group.hosts[0],
+	        x: groupX,
+	        y: groupBaseY + hostOffset,
+	        fixed: true
+	      });
+	    } else {
+	      const hostSpacing = 80;
+	      const hostRowWidth = (hostCount - 1) * hostSpacing;
+	      const hostStartX = groupX - hostRowWidth / 2;
+
+	      group.hosts.forEach((hostId, hostIndex) => {
+	        const hostX = hostStartX + hostIndex * hostSpacing;
+	        const hostY = groupBaseY + hostOffset;
+
+	        updates.push({
+	          id: hostId,
+	          x: hostX,
+	          y: hostY,
+	          fixed: true
+	        });
+	      });
+	    }
+          }
+        });
+
+        const t1 = performance.now();
+        // 一次性更新所有节点坐标
+        nodes.update(updates);
+        const t2 = performance.now();
+
+        console.log(`自定义布局应用完成: compute=${(t1 - t0).toFixed(1)}ms, nodes.update batch=${(t2 - t1).toFixed(1)}ms, total=${(t2 - t0).toFixed(1)}ms, updates=${updates.length}`);
+      } catch (err) {
+        console.error('应用自定义布局失败:', err);
       }
-    });
-
-    const t1 = performance.now();
-    // 一次性更新所有节点坐标
-    nodes.update(updates);
-    const t2 = performance.now();
-
-    console.log(`自定义布局应用完成: compute=${(t1 - t0).toFixed(1)}ms, nodes.update batch=${(t2 - t1).toFixed(1)}ms, total=${(t2 - t0).toFixed(1)}ms, updates=${updates.length}`);
-  } catch (err) {
-    console.error('应用自定义布局失败:', err);
-  }
-}
-        // 更新统计信息
+    }
+        // 更新统计信息（局部静默刷新）
         async function updateStatistics() {
             try {
                 const response = await fetch('/api/statistics');
                 const stats = await response.json();
                 
-                // 计算全局指标（简化计算）
-                const totalThroughput = (stats.switches || 0) * 100; // 假设每个交换机100Mbps
-                const avgLatency = 10 + Math.floor(Math.random() * 10); // 模拟延迟
-                
-                document.getElementById('metric-throughput').textContent = totalThroughput + ' Mbps';
-                document.getElementById('metric-latency').textContent = avgLatency + ' ms';
+                // 1. 静默更新顶部大屏的全局指标
+                const totalThroughput = stats.total_throughput !== undefined ? stats.total_throughput : 0;
+                const avgLatency = stats.avg_latency !== undefined ? stats.avg_latency : 0;
+                document.getElementById('metric-throughput').textContent = totalThroughput.toFixed(2) + ' Mbps';
+                document.getElementById('metric-latency').textContent = avgLatency.toFixed(2) + ' ms';
+
+                // 2. 如果当前用户正点开着某台交换机的侧边栏，静默更新侧边栏里的数字！
+                if (window.currentNodeData && window.currentNodeData.nodeType === 'switch') {
+                    const sidebar = document.getElementById('sidebar');
+                    if (sidebar && sidebar.style.display !== 'none') {
+                        const dpidStr = String(window.currentNodeData.id);
+                        if (stats.switch_metrics && stats.switch_metrics[dpidStr]) {
+                            const sm = stats.switch_metrics[dpidStr];
+                            // 将最新数据更新到内存里
+                            window.currentNodeData.nodeData.throughput = sm.throughput;
+                            window.currentNodeData.nodeData.latency = sm.latency;
+                            window.currentNodeData.nodeData.loss = sm.loss;
+                            // 重新渲染侧边栏（速度极快，肉眼只有数字跳动，没有闪烁感）
+                            showNodeInfo(window.currentNodeData.id);
+                        }
+                    }
+                }
             } catch (error) {
                 console.error('获取统计信息失败:', error);
             }
         }
-        
         // 测试API连接
         async function testAPI() {
             console.log('=== 开始API测试 ===');
@@ -1990,10 +2157,6 @@ function applyCustomLayout() {
                 html += '<div class="sidebar-section">';
                 html += '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">';
                 html += '<h3 class="section-title">Flow Tables</h3>';
-                html += '<button class="btn-add-flow" onclick="showAddFlowModal()">';
-                html += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
-                html += '添加规则';
-                html += '</button>';
                 html += '</div>';
                 html += '<div class="flow-table">';
                 
@@ -2010,7 +2173,6 @@ function applyCustomLayout() {
                     html += '<line x1="12" y1="16" x2="12.01" y2="16"/>';
                     html += '</svg>';
                     html += '<p style="font-size: 14px; color: #64748b;">暂无流表规则</p>';
-                    html += '<p style="font-size: 12px; color: #475569; margin-top: 4px;">点击上方按钮添加第一条规则</p>';
                     html += '</div>';
                 }
                 
@@ -2103,55 +2265,146 @@ function applyCustomLayout() {
             document.getElementById('sidebar').style.display = 'none';
         }
         
-       // 显示添加流表模态框（简化版：自动拉端口列表 + 下拉选择）
-	async function showAddFlowModal() {
-	  const node = window.currentNodeData;
-	  if (!node) return alert('请先点击选择一个交换机节点');
-	  if (node.nodeType !== 'switch') return alert(`当前选中的是 ${node.nodeType}，请选交换机(switch)`);
-
-	  const dpid = node.id;
-
-	  // 1) 拉取端口列表
-	  const portsResp = await fetch(`/api/switches/${encodeURIComponent(dpid)}/ports`);
-	  const portsJson = await portsResp.json().catch(() => ({}));
-	  if (!portsResp.ok || portsJson.ok === false) {
-	    return alert('获取端口列表失败: ' + (portsJson.message || portsResp.statusText));
-	  }
-	  const ports = (portsJson.ports || []).map(Number).filter(Number.isFinite);
-
-	  if (ports.length === 0) return alert(`交换机 ${dpid} 没有可用端口数据`);
-
-	  // 2) 让用户从列表里选 in/out（先用最简单的 prompt 但不手输数字）
-	  const inPort = parseInt(prompt(`选择入口端口 in_port（可选: ${ports.join(', ')}）:`), 10);
-	  const outPort = parseInt(prompt(`选择出口端口 out_port（可选: ${ports.join(', ')}）:`), 10);
-
-	  if (!ports.includes(inPort) || !ports.includes(outPort)) {
-	    return alert('请选择端口列表中的端口号');
-	  }
-
-	  const flow = {
-	    dpid,
-	    priority: 100,
-	    match: { in_port: inPort },
-	    actions: [{ type: 'OUTPUT', port: outPort }]
-	  };
-
-	  const resp = await fetch('/api/flows/add', {
-	    method: 'POST',
-	    headers: { 'Content-Type': 'application/json' },
-	    body: JSON.stringify(flow)
-	  });
-
-	  const result = await resp.json().catch(() => ({}));
-	  if (!resp.ok || result.ok === false) {
-	    return alert('下发失败: ' + (result.message || resp.statusText));
-	  }
-
-	  alert(`下发成功: dpid=${dpid} in_port=${inPort} -> out_port=${outPort}`);
-	}
-	window.showAddFlowModal = showAddFlowModal;
+               // ==================== 1. 单交换机流表 (Flow) 逻辑 ====================
+        let currentFlowDpid = null;
 
 
+        function closeFlowModal() {
+            const modal = document.getElementById('flow-modal');
+            if(modal) modal.classList.remove('show');
+        }
+        window.closeFlowModal = closeFlowModal;
+
+        async function submitFlowRule() {
+            const inPort = parseInt(document.getElementById('flow-in-port').value, 10);
+            const outPort = parseInt(document.getElementById('flow-out-port').value, 10);
+            
+            if (isNaN(inPort) || isNaN(outPort)) return alert('请选择有效的端口！');
+            
+            const btn = document.getElementById('flow-submit-btn');
+            btn.textContent = '下发中...';
+            btn.disabled = true;
+            
+            const flow = {
+                dpid: currentFlowDpid,
+                priority: 100,
+                match: { in_port: inPort },
+                actions: [{ type: 'OUTPUT', port: outPort }]
+            };
+
+            try {
+                const resp = await fetch('/api/flows/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(flow)
+                });
+                const result = await resp.json().catch(() => ({}));
+                
+                if (!resp.ok || result.ok === false) {
+                    alert('下发失败: ' + (result.message || resp.statusText));
+                } else {
+                    closeFlowModal();
+                    alert(`规则下发成功！\\n交换机: SW${currentFlowDpid}\\n路径: 端口 ${inPort} -> 端口 ${outPort}`);
+                }
+            } catch (err) {
+                alert('网络请求失败: ' + err.message);
+            } finally {
+                btn.textContent = '下发规则';
+                btn.disabled = false;
+            }
+        }
+        window.submitFlowRule = submitFlowRule;
+
+        // ==================== 2. 全局意图 (Global Intent) 逻辑 ====================
+        
+        function showIntentModal() {
+            const srcSelect = document.getElementById('intent-src-host');
+            const dstSelect = document.getElementById('intent-dst-host');
+            if(!srcSelect || !dstSelect) return;
+            
+            srcSelect.innerHTML = '';
+            dstSelect.innerHTML = '';
+            
+            const hosts = [];
+            if(window.nodes) {
+                window.nodes.get().forEach(node => {
+                    if (node.nodeType === 'host') {
+                        hosts.push(node.id);
+                    }
+                });
+            }
+            
+            if (hosts.length < 2) {
+                alert('拓扑中活跃的主机数量不足 (至少需要 2 个)。\\n\\n提示：请先在 Mininet 中让主机互相 ping 一下，以便控制器学习到主机 IP 位置！');
+                return;
+            }
+            
+            let optionsHtml = '<option value="">-- 请选择主机 IP --</option>';
+            hosts.forEach(ip => {
+                optionsHtml += `<option value="${ip}">${ip}</option>`;
+            });
+            
+            srcSelect.innerHTML = optionsHtml;
+            dstSelect.innerHTML = optionsHtml;
+            
+            const modal = document.getElementById('intent-modal');
+            if(modal) modal.classList.add('show');
+        }
+        window.showIntentModal = showIntentModal;
+
+        function closeIntentModal() {
+            const modal = document.getElementById('intent-modal');
+            if(modal) modal.classList.remove('show');
+        }
+        window.closeIntentModal = closeIntentModal;
+
+        async function submitIntentRule() {
+            const srcIp = document.getElementById('intent-src-host').value;
+            const dstIp = document.getElementById('intent-dst-host').value;
+            
+            if (!srcIp || !dstIp) return alert('请选择源和目的主机！');
+            if (srcIp === dstIp) return alert('源主机和目的主机不能是同一个！');
+            
+            const btn = document.getElementById('intent-submit-btn');
+            btn.textContent = '路由计算 & 下发中...';
+            btn.disabled = true;
+            
+            try {
+                const createResp = await fetch('/api/intent/rules', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ipv4_src: srcIp, ipv4_dst: dstIp })
+                });
+                const createData = await createResp.json();
+                
+                if (!createResp.ok || createData.status === 'error') {
+                    throw new Error(createData.message || '创建规则失败');
+                }
+                
+                const ruleId = createData.rule.rule_id;
+                
+                const deployResp = await fetch(`/api/intent/rules/${ruleId}/deploy`, {
+                    method: 'POST'
+                });
+                const deployData = await deployResp.json();
+                
+                if (!deployResp.ok || deployData.status === 'error') {
+                    throw new Error(deployData.message || '部署规则失败');
+                }
+                
+                closeIntentModal();
+                
+                const pathStr = deployData.path ? deployData.path.join(' ➔ ') : '未知';
+                alert(`🎉 全网策略下发成功！\\n\\n📌 规则 ID: ${ruleId}\\n🚀 自动规划路径: ${pathStr}\\n\\n底层交换机流表已自动配置完毕。`);
+                
+            } catch (err) {
+                alert('❌ 操作失败: ' + err.message);
+            } finally {
+                btn.textContent = '一键下发全网';
+                btn.disabled = false;
+            }
+        }
+        window.submitIntentRule = submitIntentRule;
 	// 删除流表项（占位函数）
         function deleteFlow(switchId, flowId) {
             if (confirm('确定要删除这条流表规则吗？')) {
@@ -2482,6 +2735,10 @@ function applyCustomLayout() {
                 # 处理LLDP探测报告，由根控制器计算延迟并反馈
                 self.handle_lldp_report(client_addr, message)
                 return  # 已经下行，不再统一响应
+                # 【新增】：处理 subcontroller 回传的流表下发结果
+            elif message_type == 'flow_add_result':
+                self._handle_flow_add_result(message)
+                return
             else:
                 logger.warning(f"未知的消息类型: {message_type}")
                 print(f"未知的消息类型: {message_type}")
@@ -2506,6 +2763,66 @@ function applyCustomLayout() {
             error_response = {'status': 'error', 'message': f'Error processing message: {str(e)}'}
             error_data = json.dumps(error_response) + '\n'
             client_sock.sendall(error_data.encode('utf-8'))
+
+    def _handle_flow_add_result(self, msg):
+        """处理从 subcontroller 回传的流表下发结果，更新 Intent Rule 状态"""
+        rule_id = msg.get("rule_id")
+        dpid = msg.get("dpid")
+        status = msg.get("status")
+        error_msg = msg.get("error", "")
+
+        logger.info(f"收到流表下发结果: rule_id={rule_id}, dpid={dpid}, status={status}")
+
+        if not rule_id or rule_id not in INTENT_RULE_STATUS:
+            return
+
+        st = INTENT_RULE_STATUS[rule_id]
+        dpid_str = str(dpid)
+
+        # 检查这台交换机是否在规则的下发计划中
+        if dpid_str in st.get("per_switch", {}):
+            st["per_switch"][dpid_str]["status"] = status
+            if error_msg:
+                st["per_switch"][dpid_str]["error"] = error_msg
+            
+            # ========== 【修复问题二：将成功的流表保存到前端侧边栏数据源中】 ==========
+            # 状态成功则写入前端可视化的数据源
+            if status == "ok":
+                rule = INTENT_RULES.get(rule_id)
+                if rule:
+                    try:
+                        dpid_int = int(dpid)  # 统一转成整型作为 Key
+                        if dpid_int not in self.switch_flows:
+                            self.switch_flows[dpid_int] = []
+                            
+                        # 避免重复插入同一条规则
+                        if not any(f.get('id') == rule_id for f in self.switch_flows[dpid_int]):
+                            out_port = st["per_switch"][dpid_str].get("out_port", "N/A")
+                            src_ip = rule['match'].get('ipv4_src', '*')
+                            dst_ip = rule['match'].get('ipv4_dst', '*')
+                            
+                            self.switch_flows[dpid_int].append({
+                                'id': rule_id,
+                                'priority': rule.get('priority', 1000),
+                                'match': f"src={src_ip} ➔ dst={dst_ip}",
+                                'action': f"OUTPUT : {out_port}",
+                                'packets': 0
+                            })
+                    except (ValueError, TypeError):
+                        pass
+            # ======================================================================
+
+            # 统计整条路径上所有相关的交换机是否都完成了下发
+            all_statuses = [info.get("status") for info in st["per_switch"].values()]
+            if "error" in all_statuses:
+                st["state"] = "ERROR"
+            elif all(s == "ok" for s in all_statuses):
+                st["state"] = "APPLIED"
+            else:
+                st["state"] = "DEPLOYING"
+                
+            st["updated_at"] = time.time()
+            logger.info(f"意图规则 {rule_id} 状态更新为: {st['state']}")
 
     def new_method(self, client_addr, message):
         logger.debug(f"从 {client_addr} 接收到消息: {message}")
@@ -2834,11 +3151,14 @@ function applyCustomLayout() {
         m = {}
         for _ctrl, links in (self.topo or {}).items():
             for link in (links or []):
-                src = link.get("src")
-                dst = link.get("dst")
-                src_port = link.get("src_port")
-                if isinstance(src, int) and isinstance(dst, int) and isinstance(src_port, int):
+                try:
+                    # 强制转为整型，消除 json 传递带来的 str 和 int 的隔阂
+                    src = int(link.get("src"))
+                    dst = int(link.get("dst"))
+                    src_port = int(link.get("src_port"))
                     m[(src, dst)] = src_port
+                except (TypeError, ValueError):
+                    continue
         return m
 
     def _find_controller_for_switch(self, dpid):
