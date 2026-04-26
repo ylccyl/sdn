@@ -281,6 +281,39 @@ def calculate_path():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/edges_stats', methods=['GET'])
+def get_edges_stats():
+    """返回所有交换机间链路的实时指标（用于前端着色）"""
+    if server_agent is None:
+        return jsonify({'error': 'Server not initialized'}), 503
+
+    edges_info = []
+    for u, v, data in server_agent.G.edges(data=True):
+        if data.get('edge_type') != 'switch_link':
+            continue
+        try:
+            src = u
+            dst = v
+            # 统一转为可序列化的字符串
+            json.dumps(src)
+            json.dumps(dst)
+        except (TypeError, ValueError):
+            src = str(u)
+            dst = str(v)
+
+        bw = data.get('bw', 800)
+        delay = data.get('delay', 0)
+        loss = data.get('loss', 0)
+
+        edges_info.append({
+            'source': src,
+            'target': dst,
+            'bw': bw,
+            'delay': delay,
+            'loss': loss
+        })
+    return jsonify(edges_info)
+
 @app.route('/api/statistics', methods=['GET'])
 def get_statistics():
     """获取网络统计信息"""
@@ -340,70 +373,55 @@ def get_statistics():
     }
     return jsonify(stats)
 
-@app.route('/api/flows/add', methods=['POST'])
-def add_flow():
-    """下发流表（第一版：手动输入端口转发）"""
+
+@app.route('/api/flows/delete', methods=['POST'])
+def delete_flow():
+    """删除流表规则"""
     if server_agent is None:
         return jsonify({'ok': False, 'message': 'Server not initialized'}), 503
 
     payload = request.get_json(silent=True) or {}
-    # 期望 payload: {dpid, priority, match:{in_port}, actions:[{type:'OUTPUT', port}]}
     dpid = payload.get('dpid')
-    match = payload.get('match') or {}
-    actions = payload.get('actions') or []
-    priority = payload.get('priority', 100)
+    flow_id = payload.get('flow_id')
 
-    if dpid is None:
-        return jsonify({'ok': False, 'message': 'Missing dpid'}), 400
-    if 'in_port' not in match:
-        return jsonify({'ok': False, 'message': 'Missing match.in_port'}), 400
-    if not actions:
-        return jsonify({'ok': False, 'message': 'Missing actions'}), 400
+    if not dpid or not flow_id:
+        return jsonify({'ok': False, 'message': 'dpid and flow_id required'}), 400
 
-    app.logger.info(f"add_flow request: dpid={dpid}, priority={priority}, match={match}, actions={actions}")
-    app.logger.info("add_flow controller_to_switches=%s", server_agent.controller_to_switches)
-    app.logger.info("add_flow clients=%s", list(server_agent.clients.keys()))
+    try:
+        dpid_int = int(dpid)
+    except (ValueError, TypeError):
+        return jsonify({'ok': False, 'message': 'Invalid dpid'}), 400
 
-    # 查找管理该交换机的控制器
+    # 从内存数据结构中删除
+    flows = server_agent.switch_flows.get(dpid_int, [])
+    original_len = len(flows)
+    server_agent.switch_flows[dpid_int] = [f for f in flows if f.get('id') != flow_id]
+
+    if len(server_agent.switch_flows.get(dpid_int, [])) == original_len:
+        # 没有找到对应流表
+        return jsonify({'ok': False, 'message': f'Flow {flow_id} not found on switch {dpid_int}'}), 404
+
+    # 查找管理该交换机的从控制器，下发删除命令
     target_controller = None
-    for controller_key, switches in server_agent.controller_to_switches.items():
-        if dpid in switches:
-            target_controller = controller_key
+    for ctrl_key, switches in server_agent.controller_to_switches.items():
+        if dpid in switches:   # 原数据中 dpid 可能是 int 或 str，直接比较即可
+            target_controller = ctrl_key
             break
 
-    if target_controller is None:
-        return jsonify({'ok': False, 'message': f'Controller not found for switch {dpid}'}), 404
+    if target_controller:
+        msg = {
+            "type": "flow_delete",
+            "dpid": dpid,
+            "rule_id": flow_id
+        }
+        try:
+            server_agent._send_to_controller(target_controller, msg)
+            app.logger.info(f"Sent flow_delete to {target_controller} for flow {flow_id}")
+        except Exception as e:
+            app.logger.error(f"Failed to send flow_delete to {target_controller}: {e}")
+            # 即使发送失败，可视化数据已经移除，仍返回成功
 
-    msg = {
-        "type": "flow_add",
-        "dpid": dpid,
-        "priority": int(priority),
-        "match": match,
-        "actions": actions
-    }
-
-    app.logger.info("add_flow target_controller=%s for dpid=%s", target_controller, dpid)
-    server_agent._send_to_controller(target_controller, msg)
-    app.logger.info("add_flow sent flow_add to %s", target_controller)
-    
-     # ===== 新增：立刻将手动下发的流表写入图节点，前端一刷新就能看见 =====
-    dpid_key = dpid if dpid in server_agent.G.nodes else (str(dpid) if str(dpid) in server_agent.G.nodes else (int(dpid) if int(dpid) in server_agent.G.nodes else None))
-    if dpid_key is not None:
-        if 'flow_table' not in server_agent.G.nodes[dpid_key]:
-            server_agent.G.nodes[dpid_key]['flow_table'] = []
-            
-        in_port = match.get('in_port', '*')
-        out_port = actions[0].get('port', '*') if actions else '*'
-        
-        server_agent.G.nodes[dpid_key]['flow_table'].append({
-            'id': manual_rule_id,
-            'priority': int(priority),
-            'match': f"in_port={in_port}",
-            'action': f"OUTPUT : {out_port}",
-            'packets': 0
-        })
-    # ==========================================================
-    return jsonify({'ok': True, 'sent_to': [target_controller[0], target_controller[1]]})
+    return jsonify({'ok': True})
 
 @app.route('/api/switches/<int:dpid>/ports', methods=['GET'])
 def get_switch_ports(dpid):
@@ -1159,27 +1177,6 @@ class ServerAgent:
         </div>
     </div>
 
-    <!-- 流表配置弹窗 -->
-    <div class="modal-overlay" id="flow-modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <span id="flow-modal-title">添加流表规则</span>
-                <span class="modal-close" onclick="closeFlowModal()">✕</span>
-            </div>
-            <div class="form-group">
-                <label class="form-label">入端口 (In_Port)</label>
-                <select class="form-select" id="flow-in-port"></select>
-            </div>
-            <div class="form-group">
-                <label class="form-label">出端口 (Out_Port)</label>
-                <select class="form-select" id="flow-out-port"></select>
-            </div>
-            <div class="modal-footer">
-                <button class="btn-cancel" onclick="closeFlowModal()">取消</button>
-                <button class="btn-submit" id="flow-submit-btn" onclick="submitFlowRule()">下发规则</button>
-            </div>
-        </div>
-    </div>
 
     <script>
         let network = null;
@@ -1331,6 +1328,10 @@ class ServerAgent:
                 //console.log('自动刷新已启用（每30秒）');
                 // 【新增】：专门开启一个高频的轻量级定时器，每 3 秒只拉取监控数字
                 setInterval(updateStatistics, 3000);
+
+                setInterval(() => {
+                    updateEdgeColorsAndTooltips();
+                }, 8000);   // 边颜色更新降频到8秒
                 
             } catch (err) {
                 console.error('初始化网络图失败:', err);
@@ -1517,7 +1518,29 @@ function updateNetwork(data) {
           dashes = false;
           smooth = { type: 'continuous' };
         } else if (edgeType === 'switch_link') {
-          color = { color: '#06b6d4', highlight: '#22d3ee', hover: '#67e8f9' };
+            let edgeUtilization = 0;
+            if (edgeData?.bw !== undefined) {
+                const maxBw = 800;
+                const bw = Number(edgeData.bw);
+                if (!isNaN(bw)) {
+                    edgeUtilization = Math.min(1, Math.max(0, (maxBw - bw) / maxBw));
+                }
+            }
+            let baseColorHex;
+            if (edgeUtilization < 0.3) {
+                baseColorHex = '#22c55e';
+            } else if (edgeUtilization < 0.8) {
+                baseColorHex = '#eab308';
+            } else {
+                baseColorHex = '#ef4444';
+            }
+
+            // 对应边类型的颜色应用
+            color = {
+                color: baseColorHex,
+                highlight: baseColorHex,
+                hover: baseColorHex
+            };
           width = 2.5;
           dashes = false;
           smooth = { type: 'curvedCW', roundness: 0.4 };
@@ -1531,15 +1554,15 @@ function updateNetwork(data) {
         console.log(`添加边 ${index}: ${source} -> ${target} (${edgeType})`);
 
         edgeBatch.push({
-          id: `edge-${index}`,
-          from: source,
-          to: target,
-          color,
-          width,
-          dashes,
-          smooth,
-          title: `${source} -> ${target}`,
-          data: { edge_type: edgeType }
+            id: `${source}_${target}`,
+            from: source,
+            to: target,
+            color,
+            width,
+            dashes,
+            smooth,
+            title: `${source} → ${target}`,
+            data: { edge_type: edgeType, bw: edgeData?.bw, delay: edgeData?.delay, loss: edgeData?.loss }
         });
 
         addedEdges++;
@@ -1563,222 +1586,7 @@ function updateNetwork(data) {
     console.error('updateNetwork失败:', err);
   }
 }
-        // 自定义分层布局函数
-/*
-	function applyCustomLayout() {
-	  try {
-	    console.log('计算自定义布局...');
 
-	    // 关键：统一使用 window 上的 dataset/network，避免外部 nodes 为 null
-	    const nodes = window.nodes;
-	    const edges = window.edges;
-	    const network = window.network;
-	    if (!nodes || !network) throw new Error('window.nodes or window.network not initialized');
-
-	    // 收集各层节点（使用nodeType属性而不是shape）
-	    const rootNodes = [];
-	    const controllerNodes = [];
-	    const switchNodes = [];
-	    const hostNodes = [];
-
-	    nodes.get().forEach(node => {
-	      const nodeType = node.nodeType || 'unknown';
-	      if (node.id === 'RootController' || nodeType === 'root_controller') {
-		rootNodes.push(node);
-	      } else if (nodeType === 'controller') {
-		controllerNodes.push(node);
-	      } else if (nodeType === 'switch') {
-		switchNodes.push(node);
-	      } else if (nodeType === 'host') {
-		hostNodes.push(node);
-	      }
-	    });
-                
-                console.log(`节点分布 - 根:${rootNodes.length}, 从控:${controllerNodes.length}, 交换机:${switchNodes.length}, 主机:${hostNodes.length}`);
-                
-                // 构建交换机-主机组（交换机与其连接的主机作为一个整体）
-                const switchGroups = {};  // {switchId: [hostIds]}
-                
-                // 找出每个交换机连接的主机
-                edges.get().forEach(edge => {
-                    const edgeData = edge.data || {};
-                    const fromNode = nodes.get(edge.from);
-                    const toNode = nodes.get(edge.to);
-                    
-                    // 检查是否是主机-交换机连接
-                    if (edgeData.edge_type === 'host_switch' || 
-                        (fromNode && toNode && 
-                         ((fromNode.nodeType === 'switch' && toNode.nodeType === 'host') ||
-                          (fromNode.nodeType === 'host' && toNode.nodeType === 'switch')))) {
-                        
-                        const switchId = (fromNode?.nodeType === 'switch') ? edge.from : edge.to;
-                        const hostId = (fromNode?.nodeType === 'host') ? edge.from : edge.to;
-                        
-                        if (switchId && hostId) {
-                            if (!switchGroups[switchId]) {
-                                switchGroups[switchId] = [];
-                            }
-                            if (!switchGroups[switchId].includes(hostId)) {
-                                switchGroups[switchId].push(hostId);
-                            }
-                        }
-                    }
-                });
-                
-                console.log('交换机-主机组:', switchGroups);
-                
-                // 布局参数（可调整以获得最佳视觉效果）
-                const canvasWidth = 2400;      // 画布宽度
-                const canvasHeight = 1400;     // 画布高度
-                const layerHeight = 350;       // 层与层之间的垂直间距
-                const nodeSpacing = 250;       // 同一层节点之间的水平间距
-                const maxNodesPerRow = 10;     // 每行最多节点数（超过则分多行）
-                const rowSpacing = 200;        // 多行时的行间距
-                const hostOffset = 120;        // 主机相对于交换机的垂直偏移
-                
-                // ========== 第0层：根控制器 ==========
-                // 位置：顶部中心
-                const rootY = 0;
-                rootNodes.forEach((node, index) => {
-                    console.log(`放置根控制器: ${node.id} at (${canvasWidth/2}, ${rootY})`);
-                    nodes.update({
-                        id: node.id,
-                        x: canvasWidth / 2,
-                        y: rootY,
-                        fixed: true
-                    });
-                });
-                
-                // ========== 第1层：从控制器 ==========
-                // 位置：第二层，水平等间距排列，超过maxNodesPerRow则分多行
-                const controllerY = rootY + layerHeight;
-                const controllerCount = controllerNodes.length;
-                const controllerRowCount = Math.ceil(controllerCount / maxNodesPerRow);
-                
-                console.log(`放置 ${controllerCount} 个从控制器，分 ${controllerRowCount} 行`);
-                
-                controllerNodes.forEach((node, index) => {
-                    const rowIndex = Math.floor(index / maxNodesPerRow);
-                    const colIndex = index % maxNodesPerRow;
-                    const nodesInRow = Math.min(maxNodesPerRow, controllerCount - rowIndex * maxNodesPerRow);
-                    
-                    // 计算该行的起始位置（居中）
-                    const rowWidth = (nodesInRow - 1) * nodeSpacing;
-                    const startX = (canvasWidth - rowWidth) / 2;
-                    const x = startX + colIndex * nodeSpacing;
-                    const y = controllerY + rowIndex * rowSpacing;
-                    
-                    console.log(`  从控 ${index}: ${node.id} at (${x}, ${y})`);
-                    
-                    nodes.update({
-                        id: node.id,
-                        x: x,
-                        y: y,
-                        fixed: true
-                    });
-                });
-                
-                // ========== 第2层：交换机-主机组 ==========
-                // 策略：交换机与其连接的主机视为一个组，组作为整体水平排列
-                // 位置：交换机在上，主机在交换机正下方（hostOffset距离）
-                const switchLayerY = controllerY + layerHeight + (controllerRowCount > 1 ? rowSpacing : 0);
-                
-                // 创建组列表（每个组包含一个交换机和其主机）
-                const groups = [];
-                const assignedHosts = new Set();
-                
-                // 为每个交换机创建组
-                switchNodes.forEach(switchNode => {
-                    const group = {
-                        switch: switchNode,
-                        hosts: switchGroups[switchNode.id] || []
-                    };
-                    groups.push(group);
-                    
-                    // 标记已分配的主机
-                    group.hosts.forEach(hostId => assignedHosts.add(hostId));
-                });
-                
-                // 添加未分配的主机为独立组（没有连接到任何交换机的主机）
-                hostNodes.forEach(hostNode => {
-                    if (!assignedHosts.has(hostNode.id)) {
-                        groups.push({
-                            switch: null,
-                            hosts: [hostNode.id]
-                        });
-                    }
-                });
-                
-                console.log(`共 ${groups.length} 个交换机-主机组`);
-                
-                // 布局组（支持多行，每行居中等间距排列）
-                const groupCount = groups.length;
-                const groupRowCount = Math.ceil(groupCount / maxNodesPerRow);
-                
-                console.log(`开始放置 ${groupCount} 个组，分 ${groupRowCount} 行`);
-                
-                groups.forEach((group, index) => {
-                    // 计算组在第几行、第几列
-                    const rowIndex = Math.floor(index / maxNodesPerRow);
-                    const colIndex = index % maxNodesPerRow;
-                    const groupsInRow = Math.min(maxNodesPerRow, groupCount - rowIndex * maxNodesPerRow);
-                    
-                    // 计算该行的起始X坐标（使该行居中）
-                    const rowWidth = (groupsInRow - 1) * nodeSpacing;
-                    const startX = (canvasWidth - rowWidth) / 2;
-                    const groupX = startX + colIndex * nodeSpacing;
-                    const groupBaseY = switchLayerY + rowIndex * (rowSpacing + hostOffset);
-                    
-                    // 放置交换机（组的上部）
-                    if (group.switch) {
-                        console.log(`  组 ${index}: 交换机 ${group.switch.id} at (${groupX}, ${groupBaseY}), 主机数: ${group.hosts.length}`);
-                        nodes.update({
-                            id: group.switch.id,
-                            x: groupX,
-                            y: groupBaseY,
-                            fixed: true
-                        });
-                    }
-                    
-                    // 放置主机（在交换机下方，作为一个整体）
-                    const hostCount = group.hosts.length;
-                    if (hostCount > 0) {
-                        if (hostCount === 1) {
-                            // 单个主机：直接在交换机正下方
-                            nodes.update({
-                                id: group.hosts[0],
-                                x: groupX,
-                                y: groupBaseY + hostOffset,
-                                fixed: true
-                            });
-                        } else {
-                            // 多个主机：以交换机为中心水平分布
-                            const hostSpacing = 80;
-                            const hostRowWidth = (hostCount - 1) * hostSpacing;
-                            const hostStartX = groupX - hostRowWidth / 2;
-                            
-                            group.hosts.forEach((hostId, hostIndex) => {
-                                const hostX = hostStartX + hostIndex * hostSpacing;
-                                const hostY = groupBaseY + hostOffset;
-                                
-                                nodes.update({
-                                    id: hostId,
-                                    x: hostX,
-                                    y: hostY,
-                                    fixed: true
-                                });
-                            });
-                        }
-                    }
-                });
-                
-                console.log('自定义布局应用完成');
-                
-            } catch (err) {
-                console.error('应用自定义布局失败:', err);
-            }
-        }
-*/
     // 自定义分层布局函数（批量 update 版本)
     function applyCustomLayout() {
       try {
@@ -1985,6 +1793,60 @@ function updateNetwork(data) {
         console.error('应用自定义布局失败:', err);
       }
     }
+
+        let lastEdgeColors = {}; // 缓存上一次的颜色，避免无变化时更新
+
+        async function updateEdgeColorsAndTooltips() {
+            try {
+                const resp = await fetch('/api/edges_stats');
+                if (!resp.ok) return;
+                const edgesData = await resp.json();
+                if (!window.edges || !window.network) return;
+
+                const updates = [];
+                edgesData.forEach(edge => {
+                    const src = edge.source;
+                    const dst = edge.target;
+                    const edgeId = `${src}_${dst}`;
+                    if (!window.edges.get(edgeId)) return;
+
+                    const bw = Number(edge.bw) || 800;
+                    const delay = Number(edge.delay) || 0;
+                    const loss = Number(edge.loss) || 0;
+                    const maxBw = 800;
+                    const utilization = Math.min(1, Math.max(0, (maxBw - bw) / maxBw));
+
+                    let colorHex;
+                    if (utilization < 0.3) {
+                        colorHex = '#22c55e';
+                    } else if (utilization < 0.8) {
+                        colorHex = '#eab308';
+                    } else {
+                        colorHex = '#ef4444';
+                    }
+
+                    // 仅当颜色变化时才加入更新列表（进一步减少重绘）
+                    if (lastEdgeColors[edgeId] !== colorHex) {
+                        lastEdgeColors[edgeId] = colorHex;
+                        updates.push({
+                            id: edgeId,
+                            color: {
+                                color: colorHex,
+                                highlight: colorHex,
+                                hover: colorHex
+                            },
+                            title: `速率: ${(maxBw - bw).toFixed(2)} Mbps\n延迟: ${delay.toFixed(2)} ms\n丢包: ${(loss * 100).toFixed(1)}%`
+                        });
+                    }
+                });
+
+                if (updates.length > 0) {
+                    window.edges.update(updates); // 批量更新，仅一次重绘
+                }
+            } catch (err) {
+                console.error('更新边颜色失败:', err);
+            }
+        }
         // 更新统计信息（局部静默刷新）
         async function updateStatistics() {
             try {
@@ -2248,7 +2110,7 @@ function updateNetwork(data) {
             html += '</div>';
             html += '</div>';
             html += '<div class="flow-footer">';
-            html += '<span>ID: ' + safeFlowIdNum + '</span>';
+            html += '<span>ID: ' + safeFlowId + '</span>';
             html += '<div class="flow-packet-count">';
             html += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">';
             html += '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>';
@@ -2265,55 +2127,7 @@ function updateNetwork(data) {
             document.getElementById('sidebar').style.display = 'none';
         }
         
-               // ==================== 1. 单交换机流表 (Flow) 逻辑 ====================
-        let currentFlowDpid = null;
 
-
-        function closeFlowModal() {
-            const modal = document.getElementById('flow-modal');
-            if(modal) modal.classList.remove('show');
-        }
-        window.closeFlowModal = closeFlowModal;
-
-        async function submitFlowRule() {
-            const inPort = parseInt(document.getElementById('flow-in-port').value, 10);
-            const outPort = parseInt(document.getElementById('flow-out-port').value, 10);
-            
-            if (isNaN(inPort) || isNaN(outPort)) return alert('请选择有效的端口！');
-            
-            const btn = document.getElementById('flow-submit-btn');
-            btn.textContent = '下发中...';
-            btn.disabled = true;
-            
-            const flow = {
-                dpid: currentFlowDpid,
-                priority: 100,
-                match: { in_port: inPort },
-                actions: [{ type: 'OUTPUT', port: outPort }]
-            };
-
-            try {
-                const resp = await fetch('/api/flows/add', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(flow)
-                });
-                const result = await resp.json().catch(() => ({}));
-                
-                if (!resp.ok || result.ok === false) {
-                    alert('下发失败: ' + (result.message || resp.statusText));
-                } else {
-                    closeFlowModal();
-                    alert(`规则下发成功！\\n交换机: SW${currentFlowDpid}\\n路径: 端口 ${inPort} -> 端口 ${outPort}`);
-                }
-            } catch (err) {
-                alert('网络请求失败: ' + err.message);
-            } finally {
-                btn.textContent = '下发规则';
-                btn.disabled = false;
-            }
-        }
-        window.submitFlowRule = submitFlowRule;
 
         // ==================== 2. 全局意图 (Global Intent) 逻辑 ====================
         
@@ -2358,60 +2172,125 @@ function updateNetwork(data) {
         }
         window.closeIntentModal = closeIntentModal;
 
-        async function submitIntentRule() {
-            const srcIp = document.getElementById('intent-src-host').value;
-            const dstIp = document.getElementById('intent-dst-host').value;
+    async function submitIntentRule() {
+        const srcIp = document.getElementById('intent-src-host').value;
+        const dstIp = document.getElementById('intent-dst-host').value;
+        
+        if (!srcIp || !dstIp) return alert('请选择源和目的主机！');
+        if (srcIp === dstIp) return alert('源主机和目的主机不能是同一个！');
+        
+        const btn = document.getElementById('intent-submit-btn');
+        btn.textContent = '路由计算 & 下发中...';
+        btn.disabled = true;
+        
+        try {
+            // 1. 创建意图规则
+            const createResp = await fetch('/api/intent/rules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ipv4_src: srcIp, ipv4_dst: dstIp })
+            });
+            const createData = await createResp.json();
             
-            if (!srcIp || !dstIp) return alert('请选择源和目的主机！');
-            if (srcIp === dstIp) return alert('源主机和目的主机不能是同一个！');
-            
-            const btn = document.getElementById('intent-submit-btn');
-            btn.textContent = '路由计算 & 下发中...';
-            btn.disabled = true;
-            
-            try {
-                const createResp = await fetch('/api/intent/rules', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ipv4_src: srcIp, ipv4_dst: dstIp })
-                });
-                const createData = await createResp.json();
-                
-                if (!createResp.ok || createData.status === 'error') {
-                    throw new Error(createData.message || '创建规则失败');
-                }
-                
-                const ruleId = createData.rule.rule_id;
-                
-                const deployResp = await fetch(`/api/intent/rules/${ruleId}/deploy`, {
-                    method: 'POST'
-                });
-                const deployData = await deployResp.json();
-                
-                if (!deployResp.ok || deployData.status === 'error') {
-                    throw new Error(deployData.message || '部署规则失败');
-                }
-                
-                closeIntentModal();
-                
-                const pathStr = deployData.path ? deployData.path.join(' ➔ ') : '未知';
-                alert(`🎉 全网策略下发成功！\\n\\n📌 规则 ID: ${ruleId}\\n🚀 自动规划路径: ${pathStr}\\n\\n底层交换机流表已自动配置完毕。`);
-                
-            } catch (err) {
-                alert('❌ 操作失败: ' + err.message);
-            } finally {
-                btn.textContent = '一键下发全网';
-                btn.disabled = false;
+            if (!createResp.ok || createData.status === 'error') {
+                throw new Error(createData.message || '创建规则失败');
             }
-        }
-        window.submitIntentRule = submitIntentRule;
-	// 删除流表项（占位函数）
-        function deleteFlow(switchId, flowId) {
-            if (confirm('确定要删除这条流表规则吗？')) {
-                console.log('删除流表:', switchId, flowId);
-                // TODO: 实现删除逻辑
+            
+            const ruleId = createData.rule.rule_id;
+            const priority = createData.rule.priority || 1000;
+            
+            // 2. 部署规则
+            const deployResp = await fetch(`/api/intent/rules/${ruleId}/deploy`, {
+                method: 'POST'
+            });
+            const deployData = await deployResp.json();
+            
+            if (!deployResp.ok || deployData.status === 'error') {
+                throw new Error(deployData.message || '部署规则失败');
             }
+            
+            // 3. 立即更新前端缓存（乐观更新），让侧边栏立刻看到新流表
+            if (window.nodes && deployData.rule_status && deployData.rule_status.per_switch) {
+                const perSwitch = deployData.rule_status.per_switch;  // { dpid_str: {status, out_port} }
+                Object.entries(perSwitch).forEach(([dpidStr, info]) => {
+                    // 尝试匹配交换机节点（节点ID可能是整数或字符串）
+                    let switchNode = window.nodes.get(dpidStr);
+                    if (!switchNode) {
+                        // 尝试整数
+                        const dpidInt = parseInt(dpidStr, 10);
+                        if (!isNaN(dpidInt)) switchNode = window.nodes.get(dpidInt);
+                    }
+                    if (!switchNode) return;
+
+                    // 确保有 flow_table 数组
+                    if (!switchNode.nodeData.flow_table) {
+                        switchNode.nodeData.flow_table = [];
+                    }
+
+                    // 避免重复添加同一规则
+                    if (!switchNode.nodeData.flow_table.some(f => f.id === ruleId)) {
+                        switchNode.nodeData.flow_table.push({
+                            id: ruleId,
+                            priority: priority,
+                            match: `src=${srcIp} ➔ dst=${dstIp}`,
+                            action: `OUTPUT : ${info.out_port}`,
+                            packets: 0
+                        });
+                        // 更新 DataSet
+                        window.nodes.update({ id: switchNode.id, nodeData: switchNode.nodeData });
+                    }
+                });
+            }
+
+            // 4. 如果当前侧边栏正在展示某台交换机，立即刷新侧边栏
+            if (window.currentNodeId) {
+                showNodeInfo(window.currentNodeId);
+            }
+
+            closeIntentModal();
+            
+            const pathStr = deployData.path ? deployData.path.join(' ➔ ') : '未知';
+            alert(`🎉 全网策略下发成功！\n\n📌 规则 ID: ${ruleId}\n🚀 自动规划路径: ${pathStr}\n\n底层交换机流表已自动配置完毕。`);
+            
+        } catch (err) {
+            alert('❌ 操作失败: ' + err.message);
+        } finally {
+            btn.textContent = '一键下发全网';
+            btn.disabled = false;
         }
+    }
+
+    async function deleteFlow(switchId, flowId) {
+        if (!confirm('确定要删除这条流表规则吗？')) return;
+        try {
+            const resp = await fetch('/api/flows/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dpid: switchId, flow_id: flowId })
+            });
+            const result = await resp.json().catch(() => ({}));
+            if (!resp.ok || result.ok === false) {
+                alert('删除失败: ' + (result.message || resp.statusText));
+            } else {
+                // 1. 更新前端缓存，让侧边栏立刻看见变化
+                if (window.currentNodeId && window.nodes) {
+                    const node = window.nodes.get(window.currentNodeId);
+                    if (node && node.nodeData && node.nodeData.flow_table) {
+                        node.nodeData.flow_table = node.nodeData.flow_table.filter(f => f.id !== flowId);
+                        window.nodes.update({ id: window.currentNodeId, nodeData: node.nodeData });
+                    }
+                }
+                // 2. 刷新侧边栏
+                if (window.currentNodeId) {
+                    showNodeInfo(window.currentNodeId);
+                } else {
+                    refreshTopology();
+                }
+            }
+        } catch (err) {
+            alert('网络请求失败: ' + err.message);
+        }
+    }
         
         // 自适应缩放
         function fitNetwork() {

@@ -287,7 +287,7 @@ class ControllerManager:
             log_dir = self.log_dir
             print('提示:')
             print(f'  - 查看日志: tail -f {log_dir}/ryu_controller_<PORT>.log')
-            print('  - 停止所有控制器: python3 start_controllers.py stop')
+            print('  - 关闭后重新启动: python3.6 start_controllers.py start -n')
             print('  - 查看状态: python3 start_controllers.py status')
         print()
     
