@@ -1364,26 +1364,23 @@ class ServerAgent:
             const lossPct  = (Number(loss || 0) * 100).toFixed(2);
             const delayStr = Number(delay || 0).toFixed(2);
             const bwStr    = health.freeBw.toFixed(1);
-            const dot      = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${health.color};margin-right:4px;"></span>`;
-            return [
-                `<div style="font-family:monospace;font-size:12px;line-height:1.6;padding:4px 6px;min-width:190px;">`,
-                `<b style="color:#e2e8f0;">${src} → ${dst}</b><br/>`,
-                `<span style="color:#94a3b8;">Type:</span> <span style="color:#cbd5e0;">${edgeType}</span><br/>`,
-                `<span style="color:#94a3b8;">Delay:</span> <span style="color:#fde68a;">${delayStr} ms</span><br/>`,
-                `<span style="color:#94a3b8;">Loss:</span>  <span style="color:#fca5a5;">${lossPct} %</span><br/>`,
-                `<span style="color:#94a3b8;">Free BW:</span> <span style="color:#6ee7b7;">${bwStr} Mbps</span><br/>`,
-                `<span style="color:#94a3b8;">Used BW:</span> <span style="color:#93c5fd;">${usedBw} Mbps</span><br/>`,
-                `<span style="color:#94a3b8;">Health:</span> ${dot}<span style="color:${health.color};">${health.label} (score ${health.score}/100)</span>`,
-                `</div>`
-            ].join('');
+            
+            return `${src} -> ${dst}\n` +
+                   `Type: ${edgeType}\n` +
+                   `Delay: ${delayStr} ms\n` +
+                   `Loss: ${lossPct} %\n` +
+                   `Free BW: ${bwStr} Mbps\n` +
+                   `Used BW: ${usedBw} Mbps\n` +
+                   `Health: ${health.label} (Score: ${health.score}/100)`;
         }
 
-
+        // 创建节点 SVG 图标
+        function createIconSVG(iconType, color) {
             const svgMap = {
                 'globe': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
                 'server': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
-                'network': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-6a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v6"/><path d="M12 12V8"/></svg>',
-                'laptop': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="12" rx="2" ry="2"/><line x1="2" y1="16" x2="22" y2="16"/><line x1="6" y1="20" x2="6.01" y2="20"/><line x1="10" y1="20" x2="10.01" y2="20"/><line x1="14" y1="20" x2="14.01" y2="20"/><line x1="18" y1="20" x2="18.01" y2="20"/></svg>'
+                'network': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/></svg>',
+                'laptop': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="2" y1="20" x2="22" y2="20"/></svg>'
             };
             return svgMap[iconType] || svgMap['laptop'];
         }
@@ -1393,7 +1390,7 @@ class ServerAgent:
             const encoded = encodeURIComponent(svgString);
             return 'data:image/svg+xml;charset=utf-8,' + encoded;
         }
-        
+
         // 初始化网络图
         function initNetwork() {
             try {
@@ -1508,7 +1505,7 @@ class ServerAgent:
 		    document.getElementById('sidebar').style.display = 'flex';
 		  }
 		});
-                
+
                 console.log('事件监听器已设置');
                 
                 // 加载拓扑
