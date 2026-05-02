@@ -65,6 +65,10 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # 全局server_agent实例引用（在main()中初始化）
 server_agent = None
+
+# Demo mode: in-memory injected link metrics (POST /api/demo/inject_link_metrics)
+# key: "src_dst", value: {src, dst, delay_ms, loss_frac, bw_mbps, injected_at}
+DEMO_LINK_METRICS = {}
         
 @app.route('/')
 def index():
@@ -305,6 +309,15 @@ def get_edges_stats():
         delay = data.get('delay', 0)
         loss = data.get('loss', 0)
 
+        # Merge demo-injected metrics (demo values override graph values when present)
+        demo_key = f"{src}_{dst}"
+        demo_rev  = f"{dst}_{src}"
+        demo = DEMO_LINK_METRICS.get(demo_key) or DEMO_LINK_METRICS.get(demo_rev)
+        if demo:
+            bw    = demo.get('bw_mbps',   bw)
+            delay = demo.get('delay_ms',  delay)
+            loss  = demo.get('loss_frac', loss)
+
         edges_info.append({
             'source': src,
             'target': dst,
@@ -314,8 +327,78 @@ def get_edges_stats():
         })
     return jsonify(edges_info)
 
-@app.route('/api/statistics', methods=['GET'])
-def get_statistics():
+
+@app.route('/api/demo/inject_link_metrics', methods=['POST'])
+def inject_link_metrics():
+    """Demo/diagnostic endpoint: inject link metrics for a switch-to-switch edge.
+
+    JSON body::
+
+        {
+          "src":       "1",          // source switch DPID (string or int)
+          "dst":       "2",          // destination switch DPID (string or int)
+          "delay_ms":  15.0,         // one-way delay in milliseconds  (optional)
+          "loss_frac": 0.02,         // loss fraction 0..1  (optional, e.g. 0.02 = 2%)
+          "bw_mbps":   600.0         // free/available bandwidth in Mbps  (optional)
+        }
+
+    A field may be omitted to keep the current value for that dimension.
+    Send an empty body or ``{}`` with only src+dst to clear injected metrics for
+    that link.
+    """
+    payload = request.get_json(silent=True) or {}
+    src = payload.get('src')
+    dst = payload.get('dst')
+
+    if src is None or dst is None:
+        return jsonify({'ok': False, 'message': 'src and dst are required'}), 400
+
+    src = str(src)
+    dst = str(dst)
+
+    # Validate optional numeric fields
+    for field in ('delay_ms', 'loss_frac', 'bw_mbps'):
+        if field in payload:
+            try:
+                float(payload[field])
+            except (TypeError, ValueError):
+                return jsonify({'ok': False, 'message': f'{field} must be a number'}), 400
+
+    # If no metric fields supplied treat as clear
+    metric_fields = {k: float(payload[k]) for k in ('delay_ms', 'loss_frac', 'bw_mbps') if k in payload}
+
+    demo_key = f"{src}_{dst}"
+    if not metric_fields:
+        DEMO_LINK_METRICS.pop(demo_key, None)
+        DEMO_LINK_METRICS.pop(f"{dst}_{src}", None)
+        result = {'ok': True, 'action': 'cleared', 'src': src, 'dst': dst}
+    else:
+        entry = DEMO_LINK_METRICS.get(demo_key, {'src': src, 'dst': dst})
+        entry.update(metric_fields)
+        entry['injected_at'] = time.time()
+        DEMO_LINK_METRICS[demo_key] = entry
+
+        # Also propagate into the live graph so /api/graph picks them up
+        if server_agent is not None:
+            for s, d in [(src, dst), (dst, src)]:
+                try:
+                    s_key = int(s) if str(s).isdigit() else s
+                    d_key = int(d) if str(d).isdigit() else d
+                except Exception:
+                    s_key, d_key = s, d
+                if server_agent.G.has_edge(s_key, d_key):
+                    if 'delay_ms' in metric_fields:
+                        server_agent.G[s_key][d_key]['delay'] = metric_fields['delay_ms']
+                    if 'loss_frac' in metric_fields:
+                        server_agent.G[s_key][d_key]['loss'] = metric_fields['loss_frac']
+                    if 'bw_mbps' in metric_fields:
+                        server_agent.G[s_key][d_key]['bw'] = metric_fields['bw_mbps']
+
+        result = {'ok': True, 'action': 'injected', 'metrics': entry}
+
+    return jsonify(result)
+
+
     """获取网络统计信息"""
     if server_agent is None:
         return jsonify({'error': 'Server not initialized'}), 503
@@ -1185,8 +1268,93 @@ class ServerAgent:
 	let currentNodeId = null;
 	let currentNodeData = null;
 
-        // 创建SVG图标（基于lucide-react图标，与SDN.txt保持一致）
-        function createIconSVG(iconType, color) {
+        // ===== CONFIGURABLE LINK HEALTH THRESHOLDS (thesis demo mode) =====
+        // Bandwidth reference (Mbps) – edges are assumed to have free BW up to this value
+        const LINK_MAX_BW       = 800;
+        // Delay thresholds (ms)
+        const LINK_DELAY_WARN   = 10;    // yellow  if delay > 10 ms
+        const LINK_DELAY_BAD    = 30;    // orange  if delay > 30 ms
+        const LINK_DELAY_CRIT   = 100;   // red     if delay > 100 ms
+        // Loss thresholds (fraction 0..1)
+        const LINK_LOSS_WARN    = 0.01;  // yellow  if loss > 1%
+        const LINK_LOSS_BAD     = 0.05;  // orange  if loss > 5%
+        const LINK_LOSS_CRIT    = 0.15;  // red     if loss > 15%
+        // Utilisation thresholds (fraction 0..1, derived from free BW)
+        const LINK_UTIL_WARN    = 0.30;  // yellow  if utilisation > 30%
+        const LINK_UTIL_BAD     = 0.60;  // orange  if utilisation > 60%
+        const LINK_UTIL_CRIT    = 0.85;  // red     if utilisation > 85%
+        // Colors
+        const LINK_COLOR_GREEN  = '#22c55e';
+        const LINK_COLOR_YELLOW = '#eab308';
+        const LINK_COLOR_ORANGE = '#f97316';
+        const LINK_COLOR_RED    = '#ef4444';
+        // ===================================================================
+
+        /**
+         * Compute a link health descriptor from raw metrics.
+         * Returns { severity: 0..3, color, label, score: 0..100 }
+         * where severity 0=Healthy, 1=Warning, 2=Degraded, 3=Critical.
+         */
+        function computeLinkHealth(bw, delay, loss) {
+            const util     = Math.min(1, Math.max(0, (LINK_MAX_BW - Number(bw  || LINK_MAX_BW)) / LINK_MAX_BW));
+            const delayMs  = Number(delay || 0);
+            const lossFrac = Number(loss  || 0);
+
+            let severity = 0;
+
+            // BW / utilisation
+            if      (util    >= LINK_UTIL_CRIT)  severity = Math.max(severity, 3);
+            else if (util    >= LINK_UTIL_BAD)   severity = Math.max(severity, 2);
+            else if (util    >= LINK_UTIL_WARN)  severity = Math.max(severity, 1);
+
+            // Delay
+            if      (delayMs >= LINK_DELAY_CRIT) severity = Math.max(severity, 3);
+            else if (delayMs >= LINK_DELAY_BAD)  severity = Math.max(severity, 2);
+            else if (delayMs >= LINK_DELAY_WARN) severity = Math.max(severity, 1);
+
+            // Loss
+            if      (lossFrac >= LINK_LOSS_CRIT) severity = Math.max(severity, 3);
+            else if (lossFrac >= LINK_LOSS_BAD)  severity = Math.max(severity, 2);
+            else if (lossFrac >= LINK_LOSS_WARN) severity = Math.max(severity, 1);
+
+            const COLORS  = [LINK_COLOR_GREEN, LINK_COLOR_YELLOW, LINK_COLOR_ORANGE, LINK_COLOR_RED];
+            const LABELS  = ['Healthy', 'Warning', 'Degraded', 'Critical'];
+            const SCORES  = [100, 70, 40, 10];
+            const WIDTHS  = [2.5, 3.0, 3.5, 4.0];
+            return {
+                severity,
+                color:  COLORS[severity],
+                label:  LABELS[severity],
+                score:  SCORES[severity],
+                width:  WIDTHS[severity]
+            };
+        }
+
+        /**
+         * Build a rich HTML tooltip string for a switch-to-switch link.
+         */
+        function buildSwitchLinkTooltip(src, dst, edgeType, bw, delay, loss) {
+            const health  = computeLinkHealth(bw, delay, loss);
+            const util    = Math.min(1, Math.max(0, (LINK_MAX_BW - Number(bw || LINK_MAX_BW)) / LINK_MAX_BW));
+            const throughput = (LINK_MAX_BW - Number(bw || LINK_MAX_BW)).toFixed(1);
+            const lossPct = (Number(loss || 0) * 100).toFixed(2);
+            const delayStr = Number(delay || 0).toFixed(2);
+            const bwStr    = Number(bw    || LINK_MAX_BW).toFixed(1);
+            const dot      = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${health.color};margin-right:4px;"></span>`;
+            return [
+                `<div style="font-family:monospace;font-size:12px;line-height:1.6;padding:4px 6px;min-width:190px;">`,
+                `<b style="color:#e2e8f0;">${src} → ${dst}</b><br/>`,
+                `<span style="color:#94a3b8;">Type:</span> <span style="color:#cbd5e0;">${edgeType}</span><br/>`,
+                `<span style="color:#94a3b8;">Delay:</span> <span style="color:#fde68a;">${delayStr} ms</span><br/>`,
+                `<span style="color:#94a3b8;">Loss:</span>  <span style="color:#fca5a5;">${lossPct} %</span><br/>`,
+                `<span style="color:#94a3b8;">Free BW:</span> <span style="color:#6ee7b7;">${bwStr} Mbps</span><br/>`,
+                `<span style="color:#94a3b8;">Throughput:</span> <span style="color:#93c5fd;">${throughput} Mbps</span><br/>`,
+                `<span style="color:#94a3b8;">Health:</span> ${dot}<span style="color:${health.color};">${health.label} (score ${health.score}/100)</span>`,
+                `</div>`
+            ].join('');
+        }
+
+
             const svgMap = {
                 'globe': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
                 'server': '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="' + color + '" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
@@ -1518,32 +1686,11 @@ function updateNetwork(data) {
           dashes = false;
           smooth = { type: 'continuous' };
         } else if (edgeType === 'switch_link') {
-            let edgeUtilization = 0;
-            if (edgeData?.bw !== undefined) {
-                const maxBw = 800;
-                const bw = Number(edgeData.bw);
-                if (!isNaN(bw)) {
-                    edgeUtilization = Math.min(1, Math.max(0, (maxBw - bw) / maxBw));
-                }
-            }
-            let baseColorHex;
-            if (edgeUtilization < 0.3) {
-                baseColorHex = '#22c55e';
-            } else if (edgeUtilization < 0.8) {
-                baseColorHex = '#eab308';
-            } else {
-                baseColorHex = '#ef4444';
-            }
-
-            // 对应边类型的颜色应用
-            color = {
-                color: baseColorHex,
-                highlight: baseColorHex,
-                hover: baseColorHex
-            };
-          width = 2.5;
-          dashes = false;
-          smooth = { type: 'curvedCW', roundness: 0.4 };
+            const health = computeLinkHealth(edgeData?.bw, edgeData?.delay, edgeData?.loss);
+            color = { color: health.color, highlight: health.color, hover: health.color };
+            width = health.width;
+            dashes = false;
+            smooth = { type: 'curvedCW', roundness: 0.4 };
         } else {
           color = { color: '#475569', highlight: '#64748b', hover: '#94a3b8' };
           width = 2;
@@ -1553,6 +1700,10 @@ function updateNetwork(data) {
 
         console.log(`添加边 ${index}: ${source} -> ${target} (${edgeType})`);
 
+        const edgeTitle = (edgeType === 'switch_link')
+            ? buildSwitchLinkTooltip(source, target, edgeType, edgeData?.bw, edgeData?.delay, edgeData?.loss)
+            : `${source} → ${target} (${edgeType})`;
+
         edgeBatch.push({
             id: `${source}_${target}`,
             from: source,
@@ -1561,7 +1712,7 @@ function updateNetwork(data) {
             width,
             dashes,
             smooth,
-            title: `${source} → ${target}`,
+            title: edgeTitle,
             data: { edge_type: edgeType, bw: edgeData?.bw, delay: edgeData?.delay, loss: edgeData?.loss }
         });
 
@@ -1810,32 +1961,21 @@ function updateNetwork(data) {
                     const edgeId = `${src}_${dst}`;
                     if (!window.edges.get(edgeId)) return;
 
-                    const bw = Number(edge.bw) || 800;
+                    const bw    = Number(edge.bw)    || LINK_MAX_BW;
                     const delay = Number(edge.delay) || 0;
-                    const loss = Number(edge.loss) || 0;
-                    const maxBw = 800;
-                    const utilization = Math.min(1, Math.max(0, (maxBw - bw) / maxBw));
+                    const loss  = Number(edge.loss)  || 0;
 
-                    let colorHex;
-                    if (utilization < 0.3) {
-                        colorHex = '#22c55e';
-                    } else if (utilization < 0.8) {
-                        colorHex = '#eab308';
-                    } else {
-                        colorHex = '#ef4444';
-                    }
+                    const health  = computeLinkHealth(bw, delay, loss);
+                    const newKey  = `${health.color}_${health.width}`;
 
-                    // 仅当颜色变化时才加入更新列表（进一步减少重绘）
-                    if (lastEdgeColors[edgeId] !== colorHex) {
-                        lastEdgeColors[edgeId] = colorHex;
+                    // Only push an update when color or width actually changed
+                    if (lastEdgeColors[edgeId] !== newKey) {
+                        lastEdgeColors[edgeId] = newKey;
                         updates.push({
                             id: edgeId,
-                            color: {
-                                color: colorHex,
-                                highlight: colorHex,
-                                hover: colorHex
-                            },
-                            title: `速率: ${(maxBw - bw).toFixed(2)} Mbps\n延迟: ${delay.toFixed(2)} ms\n丢包: ${(loss * 100).toFixed(1)}%`
+                            color: { color: health.color, highlight: health.color, hover: health.color },
+                            width: health.width,
+                            title: buildSwitchLinkTooltip(src, dst, 'switch_link', bw, delay, loss)
                         });
                     }
                 });
