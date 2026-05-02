@@ -390,8 +390,14 @@ def inject_link_metrics():
         # Also propagate into the live graph so /api/graph picks them up
         if server_agent is not None:
             for s, d in [(src, dst), (dst, src)]:
-                s_key = int(s) if str(s).isdigit() else s
-                d_key = int(d) if str(d).isdigit() else d
+                try:
+                    s_key = int(s)
+                except (ValueError, TypeError):
+                    s_key = s
+                try:
+                    d_key = int(d)
+                except (ValueError, TypeError):
+                    d_key = d
                 if server_agent.G.has_edge(s_key, d_key):
                     if 'delay_ms' in metric_fields:
                         server_agent.G[s_key][d_key]['delay'] = metric_fields['delay_ms']
@@ -1277,7 +1283,9 @@ class ServerAgent:
 	let currentNodeData = null;
 
         // ===== CONFIGURABLE LINK HEALTH THRESHOLDS (thesis demo mode) =====
-        // Bandwidth reference (Mbps) – edges are assumed to have free BW up to this value
+        // Bandwidth reference (Mbps) – set this to match your network's actual link capacity
+        // so that utilisation is computed correctly (e.g. 1000 for a 1 Gbps fabric).
+        // Default 800 Mbps reflects a typical Fast-Ethernet / mininet veth cap in the demo.
         const LINK_MAX_BW       = 800;
         // Delay thresholds (ms)
         const LINK_DELAY_WARN   = 10;    // yellow  if delay > 10 ms
@@ -1342,7 +1350,8 @@ class ServerAgent:
                 score:  SCORES[severity],
                 width:  WIDTHS[severity],
                 util,
-                freeBw
+                freeBw,
+                usedBw: util * LINK_MAX_BW
             };
         }
 
@@ -1351,8 +1360,7 @@ class ServerAgent:
          */
         function buildSwitchLinkTooltip(src, dst, edgeType, bw, delay, loss) {
             const health   = computeLinkHealth(bw, delay, loss);
-            // Derive usedBw from util to avoid repeating the calculation
-            const usedBw   = (health.util * LINK_MAX_BW).toFixed(1);
+            const usedBw   = health.usedBw.toFixed(1);
             const lossPct  = (Number(loss || 0) * 100).toFixed(2);
             const delayStr = Number(delay || 0).toFixed(2);
             const bwStr    = health.freeBw.toFixed(1);
