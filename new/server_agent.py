@@ -1311,7 +1311,10 @@ class ServerAgent:
             // but treat 0 as genuine 0 free-BW (fully saturated link).
             const freeBw   = (bw !== undefined && bw !== null) ? Number(bw) : LINK_MAX_BW;
             // If freeBw > LINK_MAX_BW (e.g., link reports higher capacity), util clamps to 0 (no utilisation).
-            const util     = Math.min(1, Math.max(0, (LINK_MAX_BW - freeBw) / LINK_MAX_BW));
+            // Guard against LINK_MAX_BW=0 to avoid division by zero.
+            const util     = LINK_MAX_BW > 0
+                ? Math.min(1, Math.max(0, (LINK_MAX_BW - freeBw) / LINK_MAX_BW))
+                : 0;
             const delayMs  = Number(delay || 0);
             const lossFrac = Number(loss  || 0);
 
@@ -1352,8 +1355,8 @@ class ServerAgent:
          */
         function buildSwitchLinkTooltip(src, dst, edgeType, bw, delay, loss) {
             const health   = computeLinkHealth(bw, delay, loss);
-            // usedBw: clamp to 0 if freeBw exceeds the reference max (e.g., higher-capacity link)
-            const usedBw   = Math.max(0, LINK_MAX_BW - health.freeBw).toFixed(1);
+            // Derive usedBw from util to avoid repeating the calculation
+            const usedBw   = (health.util * LINK_MAX_BW).toFixed(1);
             const lossPct  = (Number(loss || 0) * 100).toFixed(2);
             const delayStr = Number(delay || 0).toFixed(2);
             const bwStr    = health.freeBw.toFixed(1);
@@ -1978,10 +1981,10 @@ function updateNetwork(data) {
                     const edgeId = `${src}_${dst}`;
                     if (!window.edges.get(edgeId)) return;
 
-                    // Use nullish coalescing so bw=0 (fully saturated) is preserved, not replaced by LINK_MAX_BW
-                    const bw    = (edge.bw    !== null && edge.bw    !== undefined) ? Number(edge.bw)    : LINK_MAX_BW;
-                    const delay = Number(edge.delay) || 0;
-                    const loss  = Number(edge.loss)  || 0;
+                    // Use ?? (nullish coalescing) so bw=0 (fully saturated) is preserved, not replaced by LINK_MAX_BW
+                    const bw    = Number(edge.bw    ?? LINK_MAX_BW);
+                    const delay = Number(edge.delay ?? 0);
+                    const loss  = Number(edge.loss  ?? 0);
 
                     const health  = computeLinkHealth(bw, delay, loss);
                     const newKey  = `${health.color}_${health.width}`;
