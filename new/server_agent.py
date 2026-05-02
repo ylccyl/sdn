@@ -356,16 +356,25 @@ def inject_link_metrics():
     src = str(src)
     dst = str(dst)
 
-    # Validate optional numeric fields
+    # Validate optional numeric fields (must be numbers and within valid ranges)
+    validated = {}
     for field in ('delay_ms', 'loss_frac', 'bw_mbps'):
-        if field in payload:
-            try:
-                float(payload[field])
-            except (TypeError, ValueError):
-                return jsonify({'ok': False, 'message': f'{field} must be a number'}), 400
+        if field not in payload:
+            continue
+        try:
+            val = float(payload[field])
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'message': f'{field} must be a number'}), 400
+        if field == 'delay_ms' and val < 0:
+            return jsonify({'ok': False, 'message': 'delay_ms must be >= 0'}), 400
+        if field == 'loss_frac' and not (0.0 <= val <= 1.0):
+            return jsonify({'ok': False, 'message': 'loss_frac must be between 0 and 1'}), 400
+        if field == 'bw_mbps' and val < 0:
+            return jsonify({'ok': False, 'message': 'bw_mbps must be >= 0'}), 400
+        validated[field] = val
 
     # If no metric fields supplied treat as clear
-    metric_fields = {k: float(payload[k]) for k in ('delay_ms', 'loss_frac', 'bw_mbps') if k in payload}
+    metric_fields = validated
 
     demo_key = f"{src}_{dst}"
     if not metric_fields:
@@ -384,7 +393,7 @@ def inject_link_metrics():
                 try:
                     s_key = int(s) if str(s).isdigit() else s
                     d_key = int(d) if str(d).isdigit() else d
-                except Exception:
+                except ValueError:
                     s_key, d_key = s, d
                 if server_agent.G.has_edge(s_key, d_key):
                     if 'delay_ms' in metric_fields:
@@ -1301,6 +1310,7 @@ class ServerAgent:
             // Use nullish-like check: treat null/undefined as no data (assume max BW),
             // but treat 0 as genuine 0 free-BW (fully saturated link).
             const freeBw   = (bw !== undefined && bw !== null) ? Number(bw) : LINK_MAX_BW;
+            // If freeBw > LINK_MAX_BW (e.g., link reports higher capacity), util clamps to 0 (no utilisation).
             const util     = Math.min(1, Math.max(0, (LINK_MAX_BW - freeBw) / LINK_MAX_BW));
             const delayMs  = Number(delay || 0);
             const lossFrac = Number(loss  || 0);
@@ -1342,7 +1352,8 @@ class ServerAgent:
          */
         function buildSwitchLinkTooltip(src, dst, edgeType, bw, delay, loss) {
             const health   = computeLinkHealth(bw, delay, loss);
-            const usedBw   = (LINK_MAX_BW - health.freeBw).toFixed(1);
+            // usedBw: clamp to 0 if freeBw exceeds the reference max (e.g., higher-capacity link)
+            const usedBw   = Math.max(0, LINK_MAX_BW - health.freeBw).toFixed(1);
             const lossPct  = (Number(loss || 0) * 100).toFixed(2);
             const delayStr = Number(delay || 0).toFixed(2);
             const bwStr    = health.freeBw.toFixed(1);
@@ -1967,7 +1978,8 @@ function updateNetwork(data) {
                     const edgeId = `${src}_${dst}`;
                     if (!window.edges.get(edgeId)) return;
 
-                    const bw    = Number(edge.bw)    || LINK_MAX_BW;
+                    // Use nullish coalescing so bw=0 (fully saturated) is preserved, not replaced by LINK_MAX_BW
+                    const bw    = (edge.bw    !== null && edge.bw    !== undefined) ? Number(edge.bw)    : LINK_MAX_BW;
                     const delay = Number(edge.delay) || 0;
                     const loss  = Number(edge.loss)  || 0;
 
