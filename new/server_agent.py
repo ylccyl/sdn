@@ -390,11 +390,8 @@ def inject_link_metrics():
         # Also propagate into the live graph so /api/graph picks them up
         if server_agent is not None:
             for s, d in [(src, dst), (dst, src)]:
-                try:
-                    s_key = int(s) if str(s).isdigit() else s
-                    d_key = int(d) if str(d).isdigit() else d
-                except ValueError:
-                    s_key, d_key = s, d
+                s_key = int(s) if str(s).isdigit() else s
+                d_key = int(d) if str(d).isdigit() else d
                 if server_agent.G.has_edge(s_key, d_key):
                     if 'delay_ms' in metric_fields:
                         server_agent.G[s_key][d_key]['delay'] = metric_fields['delay_ms']
@@ -1307,9 +1304,8 @@ class ServerAgent:
          * where severity 0=Healthy, 1=Warning, 2=Degraded, 3=Critical.
          */
         function computeLinkHealth(bw, delay, loss) {
-            // Use nullish-like check: treat null/undefined as no data (assume max BW),
-            // but treat 0 as genuine 0 free-BW (fully saturated link).
-            const freeBw   = (bw !== undefined && bw !== null) ? Number(bw) : LINK_MAX_BW;
+            // Use ?? (nullish coalescing): null/undefined → LINK_MAX_BW, 0 → 0 (fully saturated link).
+            const freeBw   = Number(bw ?? LINK_MAX_BW);
             // If freeBw > LINK_MAX_BW (e.g., link reports higher capacity), util clamps to 0 (no utilisation).
             // Guard against LINK_MAX_BW=0 to avoid division by zero.
             const util     = LINK_MAX_BW > 0
