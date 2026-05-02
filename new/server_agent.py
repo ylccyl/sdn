@@ -399,6 +399,8 @@ def inject_link_metrics():
     return jsonify(result)
 
 
+@app.route('/api/statistics', methods=['GET'])
+def get_statistics():
     """获取网络统计信息"""
     if server_agent is None:
         return jsonify({'error': 'Server not initialized'}), 503
@@ -1296,7 +1298,10 @@ class ServerAgent:
          * where severity 0=Healthy, 1=Warning, 2=Degraded, 3=Critical.
          */
         function computeLinkHealth(bw, delay, loss) {
-            const util     = Math.min(1, Math.max(0, (LINK_MAX_BW - Number(bw  || LINK_MAX_BW)) / LINK_MAX_BW));
+            // Use nullish-like check: treat null/undefined as no data (assume max BW),
+            // but treat 0 as genuine 0 free-BW (fully saturated link).
+            const freeBw   = (bw !== undefined && bw !== null) ? Number(bw) : LINK_MAX_BW;
+            const util     = Math.min(1, Math.max(0, (LINK_MAX_BW - freeBw) / LINK_MAX_BW));
             const delayMs  = Number(delay || 0);
             const lossFrac = Number(loss  || 0);
 
@@ -1326,7 +1331,9 @@ class ServerAgent:
                 color:  COLORS[severity],
                 label:  LABELS[severity],
                 score:  SCORES[severity],
-                width:  WIDTHS[severity]
+                width:  WIDTHS[severity],
+                util,
+                freeBw
             };
         }
 
@@ -1334,12 +1341,11 @@ class ServerAgent:
          * Build a rich HTML tooltip string for a switch-to-switch link.
          */
         function buildSwitchLinkTooltip(src, dst, edgeType, bw, delay, loss) {
-            const health  = computeLinkHealth(bw, delay, loss);
-            const util    = Math.min(1, Math.max(0, (LINK_MAX_BW - Number(bw || LINK_MAX_BW)) / LINK_MAX_BW));
-            const throughput = (LINK_MAX_BW - Number(bw || LINK_MAX_BW)).toFixed(1);
-            const lossPct = (Number(loss || 0) * 100).toFixed(2);
+            const health   = computeLinkHealth(bw, delay, loss);
+            const usedBw   = (LINK_MAX_BW - health.freeBw).toFixed(1);
+            const lossPct  = (Number(loss || 0) * 100).toFixed(2);
             const delayStr = Number(delay || 0).toFixed(2);
-            const bwStr    = Number(bw    || LINK_MAX_BW).toFixed(1);
+            const bwStr    = health.freeBw.toFixed(1);
             const dot      = `<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${health.color};margin-right:4px;"></span>`;
             return [
                 `<div style="font-family:monospace;font-size:12px;line-height:1.6;padding:4px 6px;min-width:190px;">`,
@@ -1348,7 +1354,7 @@ class ServerAgent:
                 `<span style="color:#94a3b8;">Delay:</span> <span style="color:#fde68a;">${delayStr} ms</span><br/>`,
                 `<span style="color:#94a3b8;">Loss:</span>  <span style="color:#fca5a5;">${lossPct} %</span><br/>`,
                 `<span style="color:#94a3b8;">Free BW:</span> <span style="color:#6ee7b7;">${bwStr} Mbps</span><br/>`,
-                `<span style="color:#94a3b8;">Throughput:</span> <span style="color:#93c5fd;">${throughput} Mbps</span><br/>`,
+                `<span style="color:#94a3b8;">Used BW:</span> <span style="color:#93c5fd;">${usedBw} Mbps</span><br/>`,
                 `<span style="color:#94a3b8;">Health:</span> ${dot}<span style="color:${health.color};">${health.label} (score ${health.score}/100)</span>`,
                 `</div>`
             ].join('');
