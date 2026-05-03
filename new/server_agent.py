@@ -44,6 +44,11 @@ app = Flask(__name__)
 INTENT_RULES = {}          # rule_id -> rule dict
 INTENT_RULE_STATUS = {}    # rule_id -> status dict
 
+TOPOLOGY_EVENTS = []   # [{timestamp, message, event_type}, ...]
+MAX_EVENTS = 100
+
+BLOCKED_HOSTS = set()   # 演示时临时屏蔽的主机 IP
+
 def _now_ts():
     return time.time()
 
@@ -88,6 +93,13 @@ def health_check():
         'graph_nodes': len(server_agent.G.nodes()),
         'graph_edges': len(server_agent.G.edges())
     })
+
+@app.route('/api/events', methods=['GET'])
+def get_events():
+    """返回最近的拓扑事件"""
+    since = request.args.get('since', 0, type=float)
+    events = [e for e in TOPOLOGY_EVENTS if e['timestamp'] > since]
+    return jsonify({'events': events})
 
 @app.route('/api/topo', methods=['GET'])
 def get_topo():
@@ -410,6 +422,90 @@ def inject_link_metrics():
 
     return jsonify(result)
 
+# ==================== 新增演示辅助接口（主机增删） ====================
+
+@app.route('/api/demo/host_down', methods=['POST'])
+def demo_host_down():
+    if server_agent is None:
+        return jsonify({'ok': False, 'message': 'Server not initialized'}), 503
+    data = request.get_json(silent=True) or {}
+    ip = data.get('ip')
+    if not ip:
+        return jsonify({'ok': False, 'message': 'ip required'}), 400
+
+    G = server_agent.G
+    if ip not in G:
+        return jsonify({'ok': False, 'message': f'Host {ip} not in graph'}), 404
+
+    neighbors = list(G.neighbors(ip))
+    for nbr in neighbors:
+        if G.has_edge(ip, nbr):
+            G.remove_edge(ip, nbr)
+        if G.has_edge(nbr, ip):
+            G.remove_edge(nbr, ip)
+    G.remove_node(ip)
+
+    # 从 host 内存中剔除
+    for ctrl_key, hosts in server_agent.host.items():
+        server_agent.host[ctrl_key] = [h for h in hosts if h.get('ip') != ip]
+
+    BLOCKED_HOSTS.add(ip)
+    # 记录事件
+    TOPOLOGY_EVENTS.append({
+        'timestamp': time.time(),
+        'message': f'Host {ip} removed (down)',
+        'event_type': 'host_down'
+    })
+    if len(TOPOLOGY_EVENTS) > MAX_EVENTS:
+        TOPOLOGY_EVENTS.pop(0)
+
+    return jsonify({'ok': True, 'removed': ip, 'neighbors': neighbors})
+
+@app.route('/api/demo/host_up', methods=['POST'])
+def demo_host_up():
+    if server_agent is None:
+        return jsonify({'ok': False, 'message': 'Server not initialized'}), 503
+    data = request.get_json(silent=True) or {}
+    required = ['ip', 'dpid', 'port', 'mac']
+    for f in required:
+        if f not in data:
+            return jsonify({'ok': False, 'message': f'{f} required'}), 400
+
+    ip = data['ip']
+    dpid = data['dpid']
+    port = int(data['port'])
+    mac = data['mac']
+
+    G = server_agent.G
+    if ip in G:
+        return jsonify({'ok': False, 'message': f'Host {ip} already in graph'}), 400
+    if dpid not in G:
+        return jsonify({'ok': False, 'message': f'Switch {dpid} not in graph'}), 400
+
+    G.add_node(ip, node_type='host', mac=mac)
+    G.add_edge(ip, dpid, weight=1, edge_type='host_switch')
+    G.add_edge(dpid, ip, weight=1, edge_type='host_switch')
+
+    host_entry = {'dpid': dpid, 'port': port, 'mac': mac, 'ip': ip}
+    if server_agent.host:
+        first_key = next(iter(server_agent.host))
+        server_agent.host[first_key].append(host_entry)
+    else:
+        server_agent.host[('127.0.0.1', 6654)] = [host_entry]
+
+    if ip in BLOCKED_HOSTS:
+        BLOCKED_HOSTS.discard(ip)
+
+    # 记录事件
+    TOPOLOGY_EVENTS.append({
+        'timestamp': time.time(),
+        'message': f'Host {ip} added (up)',
+        'event_type': 'host_up'
+    })
+    if len(TOPOLOGY_EVENTS) > MAX_EVENTS:
+        TOPOLOGY_EVENTS.pop(0)
+
+    return jsonify({'ok': True, 'added': ip, 'mac': mac, 'dpid': dpid, 'port': port})
 
 @app.route('/api/statistics', methods=['GET'])
 def get_statistics():
@@ -1274,6 +1370,26 @@ class ServerAgent:
         </div>
     </div>
 
+    <!-- 日志面板（从右侧滑出） -->
+        <div id="event-log-panel" style="
+            position: fixed; bottom: 0; right: -360px; width: 340px; height: 33%; max-height: 320px;
+            background: #0f172a; border-left: 1px solid #1e293b; z-index: 200;
+            transition: right 0.3s ease; display: flex; flex-direction: column;
+            box-shadow: -4px 0 20px rgba(0,0,0,0.5);">
+        <div style="padding: 16px; border-bottom: 1px solid #1e293b; display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-weight: bold; color: #e2e8f0;">📋 事件日志</span>
+            <button onclick="toggleLogPanel()" style="background: none; border: none; color: #64748b; font-size: 20px; cursor: pointer;">✕</button>
+        </div>
+        <div id="event-log-content" style="flex: 1; overflow-y: auto; padding: 12px; font-size: 13px; color: #cbd5e0;"></div>
+    </div>
+    <!-- 打开日志面板的浮动按钮 -->
+    <button onclick="toggleLogPanel()" id="log-toggle-btn" style="
+        position: fixed; bottom: 24px; right: 24px; z-index: 199;
+        background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+        border-radius: 8px; padding: 10px 16px; cursor: pointer;
+        font-size: 14px; display: flex; align-items: center; gap: 6px;">
+        📋 日志
+    </button>
 
     <script>
         let network = null;
@@ -1513,7 +1629,7 @@ class ServerAgent:
                 refreshTopology();
                 
                 // 自动刷新（每5秒）disable to increase speed
-                //setInterval(refreshTopology, 30000);
+                setInterval(refreshTopology, 40000);
                 //console.log('自动刷新已启用（每30秒）');
                 // 【新增】：专门开启一个高频的轻量级定时器，每 3 秒只拉取监控数字
                 setInterval(updateStatistics, 3000);
@@ -1561,6 +1677,42 @@ class ServerAgent:
             }
         }
         window.refreshTopology = refreshTopology;
+
+let logPanelVisible = false;
+let lastEventTime = 0;
+
+function toggleLogPanel() {
+    logPanelVisible = !logPanelVisible;
+    document.getElementById('event-log-panel').style.right = logPanelVisible ? '0' : '-360px';
+}
+
+async function fetchEvents() {
+    try {
+        const resp = await fetch(`/api/events?since=${lastEventTime}`);
+        const data = await resp.json();
+        if (data.events && data.events.length > 0) {
+            const container = document.getElementById('event-log-content');
+            data.events.forEach(e => {
+                const time = new Date(e.timestamp * 1000).toLocaleTimeString();
+                const div = document.createElement('div');
+                div.style.marginBottom = '8px';
+                div.style.padding = '6px 10px';
+                div.style.background = '#1e293b';
+                div.style.borderRadius = '6px';
+                div.style.borderLeft = '3px solid ' + (e.event_type === 'host_down' ? '#ef4444' : '#22c55e');
+                div.innerHTML = `<span style="color:#64748b;">${time}</span> ${e.message}`;
+                container.prepend(div);
+            });
+            // 更新最新事件时间戳
+            const times = data.events.map(e => e.timestamp);
+            lastEventTime = Math.max(lastEventTime, ...times);
+        }
+    } catch(e) {}
+}
+
+// 每5秒拉取一次事件日志
+setInterval(fetchEvents, 5000);
+
 		// 更新网络图
 function updateNetwork(data) {
   try {
@@ -3418,7 +3570,8 @@ function updateNetwork(data) {
                 dpid = host.get('dpid')
                 mac = host.get('mac')
                 ip = host.get('ip')
-                
+                if ip in BLOCKED_HOSTS:          # <--- 新增这三行
+                    continue
                 if dpid and ip:
                     # 确保交换机节点存在并设置正确的node_type
                     if dpid not in self.G:
